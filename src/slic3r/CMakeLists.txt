@@ -680,6 +680,10 @@ set(SLIC3R_GUI_SOURCES
 add_subdirectory(GUI/DeviceCore)
 add_subdirectory(GUI/DeviceTab)
 
+if (BBS_PY_RUNTIME)
+    add_subdirectory(Scripting)
+endif ()
+
 if (WIN32)
     list(APPEND SLIC3R_GUI_SOURCES
             GUI/dark_mode/dark_mode.hpp
@@ -838,6 +842,14 @@ if (UNIX AND NOT APPLE)
     pkg_check_modules(GSTREAMER REQUIRED gstreamer-1.0)
     pkg_check_modules(GST_BASE REQUIRED gstreamer-base-1.0)
     target_link_libraries(libslic3r_gui ${GSTREAMER_LIBRARIES} ${GST_BASE_LIBRARIES})
+
+if (BBS_PY_RUNTIME)
+    # GUI_App.cpp hooks host_init/host_shutdown; libbambu_api calls back into
+    # Plater. Static-library cycle, resolved at final link.
+    target_compile_definitions(libslic3r_gui PRIVATE BBS_PY_RUNTIME=1)
+    target_link_libraries(libslic3r_gui libbambu_api)
+    target_link_libraries(libbambu_api libslic3r_gui)
+endif ()
     target_include_directories(libslic3r_gui SYSTEM PRIVATE ${GSTREAMER_INCLUDE_DIRS} ${GST_BASE_INCLUDE_DIRS})
 endif ()
 

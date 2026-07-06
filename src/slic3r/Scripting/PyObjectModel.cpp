@@ -1,0 +1,739 @@
+// pyslic3r read-only object model (M1).
+//
+// Exposes Application / Document / Model tree / Config / Plates as an
+// inspection-only surface. Invariants:
+//   - Read-only: every member is a getter; nothing here mutates the document,
+//     config, or presets.
+//   - UI-parity: everything routes through Plater and the objects it owns
+//     (Model, PartPlateList, DynamicPrintConfig, PresetBundle) — never a
+//     parallel data path.
+//   - Main-thread-guarded: every accessor asserts the wx main thread, so
+//     off-thread callers must come through run_on_main_blocking().
+//   - Handles are indices, re-resolved per call and bounds-checked, so a stale
+//     Python handle raises rather than dereferencing a freed pointer if the
+//     model changed between calls.
+
+#include "PyBindings.hpp"
+
+#include <set>
+#include <stdexcept>
+#include <string>
+#include <vector>
+
+#include <pybind11/stl.h>
+
+#include <wx/app.h>
+#include <wx/thread.h>
+
+#include "libslic3r/libslic3r.h"
+#include "libslic3r/Model.hpp"
+#include "libslic3r/BoundingBox.hpp"
+#include "libslic3r/Config.hpp"
+#include "libslic3r/Preset.hpp"
+#include "libslic3r/PresetBundle.hpp"
+#include "libslic3r/Print.hpp"                 // Print, PrintStatistics
+#include "libslic3r/GCode/GCodeProcessor.hpp"  // GCodeProcessorResult
+#include "libslic3r/Format/bbs_3mf.hpp"        // LoadStrategy
+#include "libslic3r/CustomGCode.hpp"      // colour-change-by-height
+#include "slic3r/GUI/GUI_App.hpp"
+#include "slic3r/GUI/Plater.hpp"
+#include "slic3r/GUI/PartPlate.hpp"
+#include "slic3r/GUI/Tab.hpp"
+#include "slic3r/GUI/BackgroundSlicingProcess.hpp"   // job.cancel() -> stop()
+
+#include <boost/filesystem/path.hpp>
+#include <chrono>
+#include <cmath>
+#include <algorithm>   // std::sort
+#include <map>
+
+#include <wx/utils.h>   // wxMilliSleep
+
+namespace py = pybind11;
+using namespace Slic3r;
+
+namespace pyslic3r {
+namespace {
+
+// ---- guards + resolvers ---------------------------------------------------
+
+void main_thread(const char *what)
+{
+    if (!wxThread::IsMain())
+        throw std::runtime_error(std::string(what) +
+            " must be accessed on the wx main thread; use the marshalling primitive");
+}
+
+GUI::Plater *plater_or_throw(const char *what)
+{
+    main_thread(what);
+    auto *p = GUI::wxGetApp().plater();
+    if (p == nullptr)
+        throw std::runtime_error("no active document");
+    return p;
+}
+
+Model &model_or_throw(const char *what) { return plater_or_throw(what)->model(); }
+
+ModelObject *object_at(size_t idx, const char *what)
+{
+    Model &m = model_or_throw(what);
+    if (idx >= m.objects.size())
+        throw std::runtime_error("object index out of range (model changed?)");
+    return m.objects[idx];
+}
+
+// ---- small value converters ----------------------------------------------
+
+py::tuple vec3(const Vec3d &v) { return py::make_tuple(v.x(), v.y(), v.z()); }
+
+const char *volume_type_str(ModelVolumeType t)
+{
+    switch (t) {
+    case ModelVolumeType::MODEL_PART:         return "model_part";
+    case ModelVolumeType::NEGATIVE_VOLUME:    return "negative_volume";
+    case ModelVolumeType::PARAMETER_MODIFIER: return "modifier";
+    case ModelVolumeType::SUPPORT_BLOCKER:    return "support_blocker";
+    case ModelVolumeType::SUPPORT_ENFORCER:   return "support_enforcer";
+    default:                                  return "invalid";
+    }
+}
+
+// ---- handle types ---------------------------------------------------------
+// Each holds indices only; the referenced C++ object is re-resolved per call.
+
+struct PyApp {};
+struct PyDocument {};
+struct PyModel {};
+struct PyObject   { size_t idx; };
+struct PyVolume   { size_t obj_idx; size_t vol_idx; };
+struct PyPlateList {};
+struct PyPlate    { int idx; };
+
+// Which config a PyConfig fronts.
+enum class ConfigSource { Global, Print, Filament, Printer, Plate };
+struct PyConfig { ConfigSource source; int plate_idx = 0; };
+
+// M3 slicing handles.
+struct PySliceJob { int plate_idx; };
+struct PySliceResult
+{
+    bool                    success = false;
+    long                    print_time_s = 0;
+    long                    layer_count = 0;
+    std::map<int, double>   filament_g;    // per extruder/slot
+    std::map<int, double>   filament_mm;   // per extruder/slot (from volume)
+    std::string             gcode_path;
+    std::string             error;         // reason when !success
+};
+
+// The PresetCollection backing a preset source, or nullptr for Global/Plate.
+PresetCollection *preset_collection(ConfigSource s)
+{
+    auto *pb = GUI::wxGetApp().preset_bundle;
+    switch (s) {
+    case ConfigSource::Print:    return &pb->prints;
+    case ConfigSource::Filament: return &pb->filaments;
+    case ConfigSource::Printer:  return &pb->printers;
+    default:                     return nullptr;
+    }
+}
+
+Preset::Type preset_type(ConfigSource s)
+{
+    switch (s) {
+    case ConfigSource::Print:    return Preset::TYPE_PRINT;
+    case ConfigSource::Filament: return Preset::TYPE_FILAMENT;
+    case ConfigSource::Printer:  return Preset::TYPE_PRINTER;
+    default:                     return Preset::TYPE_INVALID;
+    }
+}
+
+GUI::PartPlate *plate_or_throw(int plate_idx, const char *what)
+{
+    auto &list = plater_or_throw(what)->get_partplate_list();
+    if (plate_idx < 0 || plate_idx >= list.get_plate_count())
+        throw std::runtime_error("plate index out of range");
+    GUI::PartPlate *plate = list.get_plate(plate_idx);
+    if (plate == nullptr) throw std::runtime_error("plate gone");
+    return plate;
+}
+
+// Read view. For preset sources this is the *edited* preset — the working copy
+// the GUI reads and writes — so a value set via Config.set reads straight back.
+const ConfigBase *resolve_config(const PyConfig &c, const char *what)
+{
+    switch (c.source) {
+    case ConfigSource::Global: {
+        const DynamicPrintConfig *cfg = plater_or_throw(what)->config();
+        if (cfg == nullptr) throw std::runtime_error("no global config");
+        return cfg;
+    }
+    case ConfigSource::Print:
+    case ConfigSource::Filament:
+    case ConfigSource::Printer: {
+        main_thread(what);
+        return &preset_collection(c.source)->get_edited_preset().config;
+    }
+    case ConfigSource::Plate: {
+        GUI::PartPlate *plate = plate_or_throw(c.plate_idx, what);
+        if (plate->config() == nullptr) throw std::runtime_error("no plate config");
+        return plate->config();
+    }
+    }
+    throw std::runtime_error("unknown config source");
+}
+
+ModelVolume *volume_at(const PyVolume &v, const char *what)
+{
+    ModelObject *obj = object_at(v.obj_idx, what);
+    if (v.vol_idx >= obj->volumes.size())
+        throw std::runtime_error("volume index out of range (model changed?)");
+    return obj->volumes[v.vol_idx];
+}
+
+// Read slice stats off a sliced plate into a PySliceResult. Main thread.
+void fill_slice_result(int plate_idx, PySliceResult &res)
+{
+    auto &list = plater_or_throw("SliceResult")->get_partplate_list();
+    GUI::PartPlate *plate = list.get_plate(plate_idx);
+    if (plate == nullptr) return;
+
+    res.gcode_path = plate->get_tmp_gcode_path();
+
+    const GCodeProcessorResult *gr = plate->get_slice_result();
+    if (gr != nullptr) {
+        const auto &st   = gr->print_statistics;
+        const auto &mode = st.modes[0];   // 0 = Normal
+        res.print_time_s = long(mode.time + 0.5f);
+        res.layer_count  = 0L; // TODO(orca): Mode has no layers_times
+
+        // total_volumes_per_extruder is mm^3 of extruded filament per extruder.
+        // length mm  = volume / filament cross-section (Ø1.75 mm default).
+        // weight g   = volume(cm^3) * density(g/cm^3), density per extruder.
+        const double area = M_PI * (1.75 / 2.0) * (1.75 / 2.0);   // mm^2
+        for (const auto &kv : st.total_volumes_per_extruder) {
+            const int    e       = int(kv.first);
+            const double vol_mm3 = kv.second;
+            res.filament_mm[e] = area > 0 ? vol_mm3 / area : 0.0;
+            const double density = (e >= 0 && e < int(gr->filament_densities.size()))
+                                       ? double(gr->filament_densities[e]) : 1.24;  // PLA fallback
+            res.filament_g[e]  = vol_mm3 / 1000.0 * density;      // mm^3 -> cm^3 * g/cm^3
+        }
+    }
+}
+
+} // anonymous namespace
+
+// ---------------------------------------------------------------------------
+
+void register_object_model(py::module_ &m)
+{
+    // ---- Config -----------------------------------------------------------
+    py::class_<PyConfig>(m, "Config")
+        .def("has", [](const PyConfig &c, const std::string &key) {
+            return resolve_config(c, "Config.has")->has(key);
+        })
+        .def("get", [](const PyConfig &c, const std::string &key) -> py::object {
+            const ConfigBase *cfg = resolve_config(c, "Config.get");
+            if (!cfg->has(key))
+                return py::none();
+            return py::str(cfg->opt_serialize(key));   // serialized string form
+        })
+        .def("keys", [](const PyConfig &c) {
+            return resolve_config(c, "Config.keys")->keys();   // -> list[str]
+        })
+        .def_property_readonly("is_dirty", [](const PyConfig &c) {
+            PresetCollection *col = preset_collection(c.source);
+            if (col == nullptr) return false;   // global/plate: not preset-dirty-tracked
+            main_thread("Config.is_dirty");
+            return col->current_is_dirty();
+        })
+        // ---- M2 mutation --------------------------------------------------
+        .def("set", [](const PyConfig &c, const std::string &key, const std::string &value) {
+            // GUI-parity: edit the working config the app watches, mark dirty,
+            // and let Plater invalidate slicing exactly as an on-screen edit.
+            if (c.source == ConfigSource::Global)
+                throw std::runtime_error(
+                    "the global config is derived and read-only; set on "
+                    "print_config / filament_config / printer_config, or a plate config");
+            auto *plater = plater_or_throw("Config.set");
+            if (c.source == ConfigSource::Plate) {
+                GUI::PartPlate *plate = plate_or_throw(c.plate_idx, "Config.set");
+                DynamicPrintConfig *cfg = plate->config();
+                if (cfg == nullptr) throw std::runtime_error("no plate config");
+                cfg->set_deserialize_strict(key, value);
+                plater->schedule_background_process();
+                return;
+            }
+            PresetCollection *col = preset_collection(c.source);
+            DynamicPrintConfig &cfg = col->get_edited_preset().config;
+            if (!cfg.has(key))
+                throw std::runtime_error("unknown config key for this preset: " + key);
+            cfg.set_deserialize_strict(key, value);
+            col->update_dirty();                 // mark preset dirty like the GUI
+            plater->on_config_change(cfg);        // diff + schedule reslice
+        }, py::arg("key"), py::arg("value"))
+        .def("apply_preset", [](const PyConfig &c, const std::string &name, bool force) {
+            // Select a named preset via the Tab — the same path the preset
+            // dropdown uses (compatibility checks, dependent tabs, dirty, and
+            // the Plater cascade). force=True force-selects, which also allows
+            // selecting a system preset that isn't yet "installed"/visible —
+            // the end state of installing it through the wizard.
+            if (preset_type(c.source) == Preset::TYPE_INVALID)
+                throw std::runtime_error("apply_preset only on print/filament/printer config");
+            main_thread("Config.apply_preset");
+            // Headless-safe: select via the PresetBundle directly. The GUI Tab
+            // path (Tab::select_preset) SIGSEGVs offscreen; this mirrors Orca's
+            // own undo/redo restore (PresetCollection::select_preset_by_name),
+            // then resolves compatible print/filament and pushes to the Plater.
+            auto *plater = plater_or_throw("Config.apply_preset");
+            PresetCollection *col = preset_collection(c.source);
+            if (col == nullptr) throw std::runtime_error("no preset collection for this config");
+            const bool ok = col->select_preset_by_name(name, force);
+            if (!ok && !force)
+                throw std::runtime_error("preset not applied (not found or incompatible): " + name);
+            PresetBundle *pb = GUI::wxGetApp().preset_bundle;
+            pb->update_compatible(PresetSelectCompatibleType::Always);
+            col->update_dirty();
+            plater->on_config_change(pb->full_config());
+        }, py::arg("name"), py::arg("force") = false);
+
+    // ---- Volume -----------------------------------------------------------
+    py::class_<PyVolume>(m, "Volume")
+        .def_property_readonly("name", [](const PyVolume &v) {
+            return volume_at(v, "Volume.name")->name;
+        })
+        .def_property_readonly("type", [](const PyVolume &v) {
+            return std::string(volume_type_str(volume_at(v, "Volume.type")->type()));
+        })
+        .def_property_readonly("is_model_part", [](const PyVolume &v) {
+            return volume_at(v, "Volume.is_model_part")->is_model_part();
+        });
+
+    // ---- Object -----------------------------------------------------------
+    py::class_<PyObject>(m, "Object")
+        .def_property_readonly("name", [](const PyObject &o) {
+            return object_at(o.idx, "Object.name")->name;
+        })
+        .def_property_readonly("index", [](const PyObject &o) { return o.idx; })
+        .def_property_readonly("instance_count", [](const PyObject &o) {
+            return object_at(o.idx, "Object.instance_count")->instances.size();
+        })
+        .def_property_readonly("volumes", [](const PyObject &o) {
+            ModelObject *obj = object_at(o.idx, "Object.volumes");
+            py::list out;
+            for (size_t i = 0; i < obj->volumes.size(); ++i)
+                out.append(PyVolume{o.idx, i});
+            return out;
+        })
+        .def("bounding_box", [](const PyObject &o) {
+            const BoundingBoxf3 &bb = object_at(o.idx, "Object.bounding_box")->bounding_box_approx();
+            py::dict d;
+            d["min"]    = vec3(bb.min);
+            d["max"]    = vec3(bb.max);
+            d["size"]   = vec3(bb.size());
+            d["center"] = vec3(bb.center());
+            return d;
+        })
+        // ---- M2 mutation (UI-parity: snapshot + Plater refresh) -----------
+        .def("translate", [](const PyObject &o, double dx, double dy, double dz) {
+            auto *plater = plater_or_throw("Object.translate");
+            ModelObject *obj = object_at(o.idx, "Object.translate");
+            GUI::Plater::TakeSnapshot snap(plater, "API: move object");
+            obj->translate_instances(Vec3d(dx, dy, dz));  // moves the placed instances
+            obj->invalidate_bounding_box();
+            plater->changed_object(int(o.idx));           // same refresh the GUI uses
+        }, py::arg("dx"), py::arg("dy"), py::arg("dz"))
+        .def("delete", [](const PyObject &o) {
+            auto *plater = plater_or_throw("Object.delete");
+            (void) object_at(o.idx, "Object.delete");     // bounds-check
+            plater->delete_object_from_model(o.idx);      // snapshots internally
+        })
+        // ---- paint-by-height: per-Z-band config overrides ------------------
+        // UI-parity: mirrors the object-list "Height range Modifier". Writes
+        // ModelObject::layer_config_ranges[{min_z,max_z}] and refreshes via
+        // changed_object, exactly like the GUI. `overrides` maps config keys to
+        // values (e.g. {"extruder": "2", "layer_height": "0.12"}). Re-slice after.
+        .def("add_height_range", [](const PyObject &o, double min_z, double max_z,
+                                    py::dict overrides) {
+            if (!(max_z > min_z))
+                throw std::runtime_error("max_z must be greater than min_z");
+            auto *plater = plater_or_throw("Object.add_height_range");
+            ModelObject *obj = object_at(o.idx, "Object.add_height_range");
+            GUI::Plater::TakeSnapshot snap(plater, "API: add height range");
+
+            const t_layer_height_range range{ min_z, max_z };
+            ModelConfig &cfg = obj->layer_config_ranges[range];   // creates entry
+
+            // Seed a well-formed range config the way the GUI does: a
+            // layer_height (from the object/preset) and extruder=0 ("use object").
+            double lh = 0.2;
+            {
+                const DynamicPrintConfig &oc = obj->config.get();
+                auto *pb = GUI::wxGetApp().preset_bundle;
+                if (oc.has("layer_height"))
+                    lh = oc.opt_float("layer_height");
+                else if (pb && pb->prints.get_edited_preset().config.has("layer_height"))
+                    lh = pb->prints.get_edited_preset().config.opt_float("layer_height");
+            }
+            cfg.set_key_value("layer_height", new ConfigOptionFloat(lh));
+            cfg.set_key_value("extruder",     new ConfigOptionInt(0));
+
+            // Apply caller overrides (serialized-string path, like Config.set).
+            for (auto kv : overrides) {
+                const std::string key = kv.first.cast<std::string>();
+                const std::string val = py::str(kv.second).cast<std::string>();
+                ConfigSubstitutionContext ctx{ ForwardCompatibilitySubstitutionRule::Disable };
+                cfg.set_deserialize(key, val, ctx);
+            }
+            plater->changed_object(int(o.idx));
+            return py::make_tuple(min_z, max_z);
+        }, py::arg("min_z"), py::arg("max_z"), py::arg("overrides") = py::dict())
+        .def("clear_height_ranges", [](const PyObject &o) {
+            auto *plater = plater_or_throw("Object.clear_height_ranges");
+            ModelObject *obj = object_at(o.idx, "Object.clear_height_ranges");
+            GUI::Plater::TakeSnapshot snap(plater, "API: clear height ranges");
+            obj->layer_config_ranges.clear();
+            plater->changed_object(int(o.idx));
+        })
+        .def("height_ranges", [](const PyObject &o) {
+            ModelObject *obj = object_at(o.idx, "Object.height_ranges");
+            py::list out;
+            for (const auto &kv : obj->layer_config_ranges) {
+                py::dict d;
+                d["min_z"] = kv.first.first;
+                d["max_z"] = kv.first.second;
+                py::dict ov;
+                const DynamicPrintConfig &c = kv.second.get();
+                for (const std::string &k : c.keys())
+                    ov[py::str(k)] = c.opt_serialize(k);
+                d["overrides"] = ov;
+                out.append(d);
+            }
+            return out;
+        });
+
+    // ---- Model ------------------------------------------------------------
+    py::class_<PyModel>(m, "Model")
+        .def_property_readonly("object_count", [](const PyModel &) {
+            return model_or_throw("Model.object_count").objects.size();
+        })
+        .def_property_readonly("objects", [](const PyModel &) {
+            Model &mo = model_or_throw("Model.objects");
+            py::list out;
+            for (size_t i = 0; i < mo.objects.size(); ++i)
+                out.append(PyObject{i});
+            return out;
+        })
+        // ---- M2 mutation --------------------------------------------------
+        .def("add", [](const PyModel &, const std::string &path) {
+            // Import geometry as object(s) via the same Plater path as GUI
+            // "Add" (LoadModel, no LoadConfig, Silence), under a snapshot.
+            auto *plater = plater_or_throw("Model.add");
+            const size_t before = plater->model().objects.size();
+            GUI::Plater::TakeSnapshot snap(plater, "API: add model");
+            std::vector<boost::filesystem::path> paths{ boost::filesystem::path(path) };
+            const auto strategy = LoadStrategy::LoadModel |
+                                  LoadStrategy::AddDefaultInstances |
+                                  LoadStrategy::Silence;
+            std::vector<size_t> idxs = plater->load_files(paths, strategy, /*ask_multi=*/false);
+            const size_t after = plater->model().objects.size();
+            if (after <= before)
+                throw std::runtime_error("no object added from: " + path);
+            return PyObject{ idxs.empty() ? after - 1 : idxs.back() };
+        }, py::arg("path"))
+        .def("remove", [](const PyModel &, const PyObject &o) {
+            auto *plater = plater_or_throw("Model.remove");
+            (void) object_at(o.idx, "Model.remove");       // bounds-check
+            plater->delete_object_from_model(o.idx);        // snapshots internally
+        }, py::arg("object"));
+
+    // ---- Plate / PlateList ------------------------------------------------
+    py::class_<PyPlate>(m, "Plate")
+        .def_property_readonly("index", [](const PyPlate &p) { return p.idx; })
+        .def_property_readonly("object_count", [](const PyPlate &p) {
+            auto &list = plater_or_throw("Plate.object_count")->get_partplate_list();
+            GUI::PartPlate *plate = list.get_plate(p.idx);
+            if (plate == nullptr) throw std::runtime_error("plate gone");
+            return plate->get_objects_on_this_plate().size();
+        })
+        .def_property_readonly("is_sliceable", [](const PyPlate &p) {
+            auto &list = plater_or_throw("Plate.is_sliceable")->get_partplate_list();
+            GUI::PartPlate *plate = list.get_plate(p.idx);
+            if (plate == nullptr) throw std::runtime_error("plate gone");
+            return plate->can_slice();
+        })
+        .def_property_readonly("config", [](const PyPlate &p) {
+            return PyConfig{ConfigSource::Plate, p.idx};
+        })
+        // ---- paint-by-height: colour changes (the multi-colour primitive) --
+        // UI-parity: mirrors the preview vertical-slider "add colour change".
+        // Writes Model::plates_custom_gcodes[plate] with ColorChange items
+        // (extruder is 1-based = AMS slot), then invalidates the slice result
+        // exactly as the slider handler does. Re-slice after (doc.slice()).
+        // `changes`: list of dicts, each {"z": <print_z>, "extruder": <1-based>,
+        //  optional "color": "#RRGGBB"} (colour auto-filled from the filament
+        //  preset colour when omitted).
+        .def("set_color_changes", [](const PyPlate &p, py::list changes) {
+            auto *plater = plater_or_throw("Plate.set_color_changes");
+            auto &list = plater->get_partplate_list();
+            GUI::PartPlate *plate = list.get_plate(p.idx);
+            if (plate == nullptr) throw std::runtime_error("plate gone");
+
+            std::vector<std::string> ext_colors =
+                plater->get_extruder_colors_from_plater_config();  // 0-based
+
+            CustomGCode::Info info;
+            info.mode = CustomGCode::Undef;
+            for (auto handle : changes) {
+                py::dict d = handle.cast<py::dict>();
+                CustomGCode::Item item;
+                item.type = CustomGCode::ColorChange;
+                if (!d.contains("z"))
+                    throw std::runtime_error("each colour change needs a 'z' (print_z)");
+                item.print_z = d["z"].cast<double>();
+                if (!d.contains("extruder"))
+                    throw std::runtime_error("each colour change needs an 'extruder' (1-based)");
+                item.extruder = d["extruder"].cast<int>();
+                if (item.extruder < 1)
+                    throw std::runtime_error("extruder is 1-based (AMS slot); must be >= 1");
+                if (d.contains("color") && !d["color"].is_none()) {
+                    item.color = d["color"].cast<std::string>();
+                } else {
+                    const int i0 = item.extruder - 1;
+                    item.color = (i0 >= 0 && i0 < int(ext_colors.size()))
+                                     ? ext_colors[i0] : std::string("#FFFFFF");
+                }
+                info.gcodes.push_back(std::move(item));
+            }
+            std::sort(info.gcodes.begin(), info.gcodes.end());
+            CustomGCode::check_mode_for_custom_gcode_per_print_z(info);
+
+            GUI::Plater::TakeSnapshot snap(plater, "API: set colour changes");
+            plater->model().plates_custom_gcodes[plate->get_index()] = std::move(info);
+            plate->update_slice_result_valid_state(false);
+            plater->schedule_background_process();
+        }, py::arg("changes"))
+        .def("clear_color_changes", [](const PyPlate &p) {
+            auto *plater = plater_or_throw("Plate.clear_color_changes");
+            auto &list = plater->get_partplate_list();
+            GUI::PartPlate *plate = list.get_plate(p.idx);
+            if (plate == nullptr) throw std::runtime_error("plate gone");
+            GUI::Plater::TakeSnapshot snap(plater, "API: clear colour changes");
+            plater->model().plates_custom_gcodes.erase(plate->get_index());
+            plate->update_slice_result_valid_state(false);
+            plater->schedule_background_process();
+        })
+        .def("color_changes", [](const PyPlate &p) {
+            auto *plater = plater_or_throw("Plate.color_changes");
+            auto &list = plater->get_partplate_list();
+            GUI::PartPlate *plate = list.get_plate(p.idx);
+            if (plate == nullptr) throw std::runtime_error("plate gone");
+            py::list out;
+            auto &m = plater->model().plates_custom_gcodes;
+            auto it = m.find(plate->get_index());
+            if (it == m.end()) return out;
+            for (const CustomGCode::Item &item : it->second.gcodes) {
+                py::dict d;
+                d["z"]        = item.print_z;
+                d["extruder"] = item.extruder;
+                d["color"]    = item.color;
+                d["type"]     = int(item.type);
+                out.append(d);
+            }
+            return out;
+        });
+
+    py::class_<PyPlateList>(m, "PlateList")
+        .def_property_readonly("count", [](const PyPlateList &) {
+            return plater_or_throw("PlateList.count")->get_partplate_list().get_plate_count();
+        })
+        .def("__len__", [](const PyPlateList &) {
+            return plater_or_throw("PlateList.__len__")->get_partplate_list().get_plate_count();
+        })
+        .def("__getitem__", [](const PyPlateList &, int i) {
+            int n = plater_or_throw("PlateList[]")->get_partplate_list().get_plate_count();
+            if (i < 0 || i >= n) throw py::index_error("plate index out of range");
+            return PyPlate{i};
+        })
+        // ---- M2 mutation --------------------------------------------------
+        .def("arrange", [](const PyPlateList &, bool wait) {
+            // Auto-arrange, same as the toolbar button. Asynchronous — starts a
+            // background ArrangeJob (which snapshots itself). With wait=True,
+            // pump the event loop (GIL released) until no job is running, so a
+            // script can rely on the finished layout (same technique as
+            // SliceJob.wait; not a nested modal loop).
+            auto *plater = plater_or_throw("PlateList.arrange");
+            plater->arrange();
+            if (!wait) return;
+            main_thread("PlateList.arrange(wait=True)");
+            py::gil_scoped_release nogil;
+            using clock = std::chrono::steady_clock;
+            const auto t0 = clock::now();
+            for (;;) {
+                if (wxTheApp != nullptr) wxTheApp->Yield(true);
+                if (plater->get_ui_job_worker().is_idle()) break;
+                if (clock::now() - t0 > std::chrono::seconds(120)) break;
+                wxMilliSleep(40);
+            }
+        }, py::arg("wait") = false);
+
+    // ---- SliceResult ------------------------------------------------------
+    py::class_<PySliceResult>(m, "SliceResult")
+        .def_property_readonly("success",       [](const PySliceResult &r) { return r.success; })
+        .def_property_readonly("print_time_s",  [](const PySliceResult &r) { return r.print_time_s; })
+        .def_property_readonly("layer_count",   [](const PySliceResult &r) { return r.layer_count; })
+        .def_property_readonly("filament_g",    [](const PySliceResult &r) { return r.filament_g; })
+        .def_property_readonly("filament_mm",   [](const PySliceResult &r) { return r.filament_mm; })
+        .def_property_readonly("gcode_3mf_path",[](const PySliceResult &r) { return r.gcode_path; })
+        .def_property_readonly("error",         [](const PySliceResult &r) { return r.error; });
+
+    // ---- SliceJob ---------------------------------------------------------
+    py::class_<PySliceJob>(m, "SliceJob")
+        .def_property_readonly("done", [](const PySliceJob &j) {
+            auto *plater = plater_or_throw("SliceJob.done");
+            GUI::PartPlate *plate = plate_or_throw(j.plate_idx, "SliceJob.done");
+            return plate->is_slice_result_valid() ||
+                   (!plater->is_background_process_slicing() &&
+                    !plater->is_background_process_update_scheduled());
+        })
+        .def_property_readonly("progress", [](const PySliceJob &) {
+            // Pollable progress placeholder; push progress is M5. Percent is
+            // not exposed publicly off the process, so report slicing state.
+            auto *plater = plater_or_throw("SliceJob.progress");
+            const char *stage = plater->is_background_process_slicing() ? "slicing" : "idle";
+            return py::make_tuple(py::none(), std::string(stage));
+        })
+        .def("cancel", [](const PySliceJob &) {
+            plater_or_throw("SliceJob.cancel")->get_ui_job_worker().cancel_all();
+        })
+        .def("wait", [](const PySliceJob &j, py::object timeout) -> PySliceResult {
+            // Runs on the wx main thread (Python's thread in this model). Pump
+            // the event loop so the slicing worker's completion/progress events
+            // are delivered, polling the plate's validity — a controlled event
+            // pump, NOT a nested modal loop. GIL is released while pumping.
+            main_thread("SliceJob.wait");
+            auto *plater = plater_or_throw("SliceJob.wait");
+            const double timeout_s = timeout.is_none() ? 300.0 : timeout.cast<double>();
+
+            PySliceResult res;
+            {
+                py::gil_scoped_release nogil;
+                using clock = std::chrono::steady_clock;
+                const auto t0 = clock::now();
+                const auto start_grace = std::chrono::milliseconds(6000);
+                GUI::PartPlate *plate = plater->get_partplate_list().get_plate(j.plate_idx);
+                bool ever_busy = false;
+                for (;;) {
+                    if (wxTheApp != nullptr) wxTheApp->Yield(true);  // deliver events
+                    if (plate != nullptr && plate->is_slice_result_valid()) {
+                        res.success = true; break;
+                    }
+                    const bool busy = plater->is_background_process_slicing() ||
+                                      plater->is_background_process_update_scheduled();
+                    if (busy) ever_busy = true;
+                    const auto elapsed = clock::now() - t0;
+                    if (ever_busy && !busy) {
+                        // It ran and stopped without producing a valid result.
+                        // Give the completion event a few more turns to land.
+                        for (int k = 0; k < 10 && !plate->is_slice_result_valid(); ++k) {
+                            if (wxTheApp != nullptr) wxTheApp->Yield(true);
+                            wxMilliSleep(50);
+                        }
+                        if (plate->is_slice_result_valid()) { res.success = true; }
+                        else { res.success = false;
+                               res.error = "slicing stopped without a valid result (slice error)"; }
+                        break;
+                    }
+                    if (!ever_busy && elapsed > start_grace) {
+                        res.success = false;
+                        res.error = "slicing never started — plate not sliceable "
+                                    "(invalid/empty config or objects off the plate)";
+                        break;
+                    }
+                    if (elapsed > std::chrono::duration<double>(timeout_s)) {
+                        res.success = false;
+                        res.error = "timeout waiting for slice";
+                        break;
+                    }
+                    wxMilliSleep(40);
+                }
+            }
+            if (res.success) fill_slice_result(j.plate_idx, res);
+            return res;
+        }, py::arg("timeout") = py::none());
+
+    // ---- Document ---------------------------------------------------------
+    py::class_<PyDocument>(m, "Document")
+        // Kept from M0 for continuity:
+        .def_property_readonly("object_count", [](const PyDocument &) {
+            return model_or_throw("Document.object_count").objects.size();
+        })
+        .def_property_readonly("model", [](const PyDocument &) { return PyModel{}; })
+        .def_property_readonly("plates", [](const PyDocument &) { return PyPlateList{}; })
+        .def_property_readonly("config", [](const PyDocument &) {
+            return PyConfig{ConfigSource::Global};
+        })
+        .def_property_readonly("print_config", [](const PyDocument &) {
+            return PyConfig{ConfigSource::Print};
+        })
+        .def_property_readonly("filament_config", [](const PyDocument &) {
+            return PyConfig{ConfigSource::Filament};
+        })
+        .def_property_readonly("printer_config", [](const PyDocument &) {
+            return PyConfig{ConfigSource::Printer};
+        })
+        // ---- M3 slicing ---------------------------------------------------
+        .def("slice", [](const PyDocument &, py::object plate) {
+            auto *plater = plater_or_throw("Document.slice");
+            auto &list = plater->get_partplate_list();
+            int idx;
+            if (plate.is_none()) {
+                idx = list.get_curr_plate_index();
+            } else {
+                idx = plate.cast<int>();
+                if (idx < 0 || idx >= list.get_plate_count())
+                    throw std::runtime_error("plate index out of range");
+                list.select_plate(idx);   // reslice targets the current plate
+            }
+            plater->reslice();            // starts the background slicing worker
+            return PySliceJob{idx};
+        }, py::arg("plate") = py::none());
+
+    // ---- Application ------------------------------------------------------
+    py::class_<PyApp>(m, "Application")
+        .def_property_readonly("version", [](const PyApp &) {
+            main_thread("app.version");
+            return std::string(SLIC3R_VERSION);
+        })
+        .def_property_readonly("active_document", [](const PyApp &) -> py::object {
+            main_thread("app.active_document");
+            if (GUI::wxGetApp().plater() == nullptr)
+                return py::none();
+            return py::cast(PyDocument{});
+        })
+        .def_property_readonly("selected_printer", [](const PyApp &) {
+            main_thread("app.selected_printer");
+            return GUI::wxGetApp().preset_bundle->printers.get_selected_preset_name();
+        })
+        .def("printers", [](const PyApp &) {
+            main_thread("app.printers");
+            // Mirror the GUI dropdown: visible printer presets only.
+            std::vector<std::string> out;
+            for (const Preset &p : GUI::wxGetApp().preset_bundle->printers.get_presets())
+                if (p.is_visible)
+                    out.push_back(p.name);
+            return out;
+        })
+        // Cloud device plane (M4). Registered in PyDevice.cpp; exposed here as
+        // app.device. Account/app-level (one logged-in account), so it hangs
+        // off Application, not Document.
+        .def_property_readonly("device", [](const PyApp &) {
+            return py::module_::import("pyslic3r").attr("_device_singleton");
+        });
+
+    m.attr("app") = py::cast(PyApp{});
+}
+
+} // namespace pyslic3r

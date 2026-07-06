@@ -121,6 +121,7 @@ option(SLIC3R_STATIC            "Compile OrcaSlicer with static libraries (Boost
 option(SLIC3R_GUI               "Compile OrcaSlicer with GUI components (OpenGL, wxWidgets)" 1)
 option(SLIC3R_FHS               "Assume OrcaSlicer is to be installed in a FHS directory structure" 0)
 option(SLIC3R_PROFILE           "Compile OrcaSlicer with an invasive Shiny profiler" 0)
+option(BBS_PY_RUNTIME           "Embed the pyslic3r Python runtime (libbambu_api)" 1)
 option(SLIC3R_PCH               "Use precompiled headers" 1)
 option(SLIC3R_MSVC_COMPILE_PARALLEL "Compile on Visual Studio in parallel" 1)
 option(SLIC3R_MSVC_PDB          "Generate PDB files on MSVC in Release mode" 1)
@@ -881,6 +882,13 @@ endfunction()
 
 # libslic3r, OrcaSlicer GUI and the OrcaSlicer executable.
 add_subdirectory(deps_src)
+if (BBS_PY_RUNTIME AND SLIC3R_GUI)
+    # Embedded pyslic3r runtime (src/slic3r/Scripting -> libbambu_api).
+    find_package(Python 3.10 REQUIRED COMPONENTS Interpreter Development.Embed)
+    find_package(pybind11 CONFIG REQUIRED)
+    message(STATUS "pyslic3r runtime enabled: Python ${Python_VERSION}, pybind11 ${pybind11_VERSION}")
+endif ()
+
 add_subdirectory(src)
 set_property(DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR} PROPERTY VS_STARTUP_PROJECT OrcaSlicer_app_gui)
 
