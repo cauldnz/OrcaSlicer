@@ -412,6 +412,32 @@ void register_object_model(py::module_ &m)
             d["instances"] = obj->instances.size();
             return d;
         })
+        // ---- geometry finish (UI-parity: drop-to-bed, scale-to-fit, rename) --
+        .def("place_on_bed", [](const PyObject &o) {
+            auto *plater = plater_or_throw("Object.place_on_bed");
+            ModelObject *obj = object_at(o.idx, "Object.place_on_bed");
+            GUI::Plater::TakeSnapshot snap(plater, std::string("API: place on bed"));
+            obj->ensure_on_bed();
+            obj->invalidate_bounding_box();
+            plater->changed_object(int(o.idx));
+        })
+        .def("scale_to_fit", [](const PyObject &o, double x, double y, double z) {
+            if (x <= 0.0 || y <= 0.0 || z <= 0.0)
+                throw std::runtime_error("fit size must be > 0");
+            auto *plater = plater_or_throw("Object.scale_to_fit");
+            ModelObject *obj = object_at(o.idx, "Object.scale_to_fit");
+            GUI::Plater::TakeSnapshot snap(plater, std::string("API: scale to fit"));
+            obj->scale_to_fit(Vec3d(x, y, z));
+            obj->invalidate_bounding_box();
+            plater->changed_object(int(o.idx));
+        }, py::arg("x"), py::arg("y"), py::arg("z"))
+        .def("rename", [](const PyObject &o, const std::string &name) {
+            auto *plater = plater_or_throw("Object.rename");
+            ModelObject *obj = object_at(o.idx, "Object.rename");
+            GUI::Plater::TakeSnapshot snap(plater, std::string("API: rename object"));
+            obj->name = name;
+            plater->changed_object(int(o.idx));
+        }, py::arg("name"))
         // ---- paint-by-height: per-Z-band config overrides ------------------
         // UI-parity: mirrors the object-list "Height range Modifier". Writes
         // ModelObject::layer_config_ranges[{min_z,max_z}] and refreshes via
