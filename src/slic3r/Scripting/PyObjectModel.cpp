@@ -535,7 +535,12 @@ void register_object_model(py::module_ &m)
             auto *plater = plater_or_throw("Model.remove");
             (void) object_at(o.idx, "Model.remove");       // bounds-check
             plater->delete_object_from_model(o.idx);        // snapshots internally
-        }, py::arg("object"));
+        }, py::arg("object"))
+        // ---- clear the scene (UI-parity: Edit -> Delete All) ---------------
+        .def("clear", [](const PyModel &) {
+            auto *plater = plater_or_throw("Model.clear");
+            plater->delete_all_objects_from_model();   // one-shot; snapshots internally
+        });
 
     // ---- Plate / PlateList ------------------------------------------------
     py::class_<PyPlate>(m, "Plate")
@@ -799,6 +804,15 @@ void register_object_model(py::module_ &m)
             if (src.empty() || !fs::exists(src))
                 throw std::runtime_error("no sliced G-code yet; call slice().wait() first");
             fs::copy_file(src, fs::path(path), fs::copy_option::overwrite_if_exists);
+            return path;
+        }, py::arg("path"))
+        // Save the project as a .3mf (UI-parity: Save Project).
+        .def("save_3mf", [](const PyDocument &, const std::string &path) {
+            namespace fs = boost::filesystem;
+            auto *plater = plater_or_throw("Document.save_3mf");
+            plater->export_3mf(fs::path(path));
+            if (!fs::exists(fs::path(path)) || fs::file_size(fs::path(path)) == 0)
+                throw std::runtime_error("3mf not written: " + path);
             return path;
         }, py::arg("path"));
 
