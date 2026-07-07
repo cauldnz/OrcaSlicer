@@ -350,6 +350,68 @@ void register_object_model(py::module_ &m)
             (void) object_at(o.idx, "Object.delete");     // bounds-check
             plater->delete_object_from_model(o.idx);      // snapshots internally
         })
+        // ---- transforms (UI-parity: the rotate / scale / mirror gizmos and
+        //      the "set number of instances" action) --------------------------
+        .def("rotate", [](const PyObject &o, double rx, double ry, double rz) {
+            auto *plater = plater_or_throw("Object.rotate");
+            ModelObject *obj = object_at(o.idx, "Object.rotate");
+            GUI::Plater::TakeSnapshot snap(plater, "API: rotate object");
+            if (rx != 0.0) obj->rotate(rx * M_PI / 180.0, X);
+            if (ry != 0.0) obj->rotate(ry * M_PI / 180.0, Y);
+            if (rz != 0.0) obj->rotate(rz * M_PI / 180.0, Z);
+            obj->invalidate_bounding_box();
+            plater->changed_object(int(o.idx));
+        }, py::arg("rx") = 0.0, py::arg("ry") = 0.0, py::arg("rz") = 0.0)
+        .def("scale", [](const PyObject &o, double x, py::object y, py::object z) {
+            const double sx = x;
+            const double sy = y.is_none() ? x : y.cast<double>();
+            const double sz = z.is_none() ? x : z.cast<double>();
+            if (sx <= 0.0 || sy <= 0.0 || sz <= 0.0)
+                throw std::runtime_error("scale factors must be > 0");
+            auto *plater = plater_or_throw("Object.scale");
+            ModelObject *obj = object_at(o.idx, "Object.scale");
+            GUI::Plater::TakeSnapshot snap(plater, "API: scale object");
+            obj->scale(Vec3d(sx, sy, sz));
+            obj->invalidate_bounding_box();
+            plater->changed_object(int(o.idx));
+        }, py::arg("x"), py::arg("y") = py::none(), py::arg("z") = py::none())
+        .def("mirror", [](const PyObject &o, const std::string &axis) {
+            Axis a;
+            if      (axis == "x" || axis == "X") a = X;
+            else if (axis == "y" || axis == "Y") a = Y;
+            else if (axis == "z" || axis == "Z") a = Z;
+            else throw std::runtime_error("axis must be 'x', 'y', or 'z'");
+            auto *plater = plater_or_throw("Object.mirror");
+            ModelObject *obj = object_at(o.idx, "Object.mirror");
+            GUI::Plater::TakeSnapshot snap(plater, "API: mirror object");
+            obj->mirror(a);
+            obj->invalidate_bounding_box();
+            plater->changed_object(int(o.idx));
+        }, py::arg("axis"))
+        .def("set_instances", [](const PyObject &o, int n) {
+            if (n < 1) throw std::runtime_error("instance count must be >= 1");
+            auto *plater = plater_or_throw("Object.set_instances");
+            ModelObject *obj = object_at(o.idx, "Object.set_instances");
+            GUI::Plater::TakeSnapshot snap(plater, "API: set instances");
+            while (int(obj->instances.size()) < n) {
+                ModelInstance *ni = obj->add_instance(*obj->instances.front());
+                ni->set_offset(ni->get_offset() + Vec3d(5.0, 5.0, 0.0));  // arrange() separates
+            }
+            while (int(obj->instances.size()) > n)
+                obj->delete_last_instance();
+            plater->changed_object(int(o.idx));
+        }, py::arg("n"))
+        .def("transform", [](const PyObject &o) {
+            ModelObject *obj = object_at(o.idx, "Object.transform");
+            const BoundingBoxf3 bb = obj->bounding_box_approx();
+            py::dict d;
+            d["size"]   = vec3(bb.size());
+            d["center"] = vec3(bb.center());
+            if (!obj->instances.empty())
+                d["position"] = vec3(obj->instances.front()->get_offset());
+            d["instances"] = obj->instances.size();
+            return d;
+        })
         // ---- paint-by-height: per-Z-band config overrides ------------------
         // UI-parity: mirrors the object-list "Height range Modifier". Writes
         // ModelObject::layer_config_ranges[{min_z,max_z}] and refreshes via
@@ -699,7 +761,20 @@ void register_object_model(py::module_ &m)
             }
             plater->reslice();            // starts the background slicing worker
             return PySliceJob{idx};
-        }, py::arg("plate") = py::none());
+        }, py::arg("plate") = py::none())
+        // Copy the current plate's last sliced G-code to `path`.
+        .def("save_gcode", [](const PyDocument &, const std::string &path) {
+            namespace fs = boost::filesystem;
+            auto *plater = plater_or_throw("Document.save_gcode");
+            auto &list = plater->get_partplate_list();
+            GUI::PartPlate *plate = list.get_plate(list.get_curr_plate_index());
+            if (plate == nullptr) throw std::runtime_error("no current plate");
+            fs::path src(plate->get_tmp_gcode_path());
+            if (src.empty() || !fs::exists(src))
+                throw std::runtime_error("no sliced G-code yet; call slice().wait() first");
+            fs::copy_file(src, fs::path(path), fs::copy_option::overwrite_if_exists);
+            return path;
+        }, py::arg("path"));
 
     // ---- Application ------------------------------------------------------
     py::class_<PyApp>(m, "Application")
