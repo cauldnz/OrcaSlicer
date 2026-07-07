@@ -5,6 +5,9 @@
 #include "GUI_Init.hpp"
 #include "GUI_ObjectList.hpp"
 #include "slic3r/GUI/UserManager.hpp"
+#ifdef BBS_PY_RUNTIME
+#include "slic3r/Scripting/PyHost.hpp"
+#endif
 #include "slic3r/GUI/TaskManager.hpp"
 #include "format.hpp"
 #include "libslic3r_version.h"
@@ -1098,6 +1101,9 @@ GUI_App::GUI_App()
 void GUI_App::shutdown()
 {
     BOOST_LOG_TRIVIAL(info) << "GUI_App::shutdown enter";
+#ifdef BBS_PY_RUNTIME
+    pyslic3r::host_shutdown();   // finalize the embedded interpreter (main thread)
+#endif
 
 	if (m_removable_drive_manager) {
 		removable_drive_manager()->shutdown();
@@ -3238,6 +3244,9 @@ bool GUI_App::on_init_inner()
             this->mainframe->register_win32_callbacks();
 #endif
             this->post_init();
+#ifdef BBS_PY_RUNTIME
+            pyslic3r::host_init();   // start the embedded pyslic3r runtime
+#endif
 
             update_publish_status();
         }

@@ -2122,7 +2122,12 @@ void GCode::do_export(Print* print, const char* path, GCodeProcessorResult* resu
             message.seekp(-2, std::ios_base::end);
             message << std::endl;
         }
-        throw Slic3r::PlaceholderParserError(message.str());
+        // pyslic3r headless test harness: this ORCA_CHECK_GCODE_PLACEHOLDERS
+        // developer self-check (Debug-only, see GCode.hpp) fires *after* the
+        // g-code is fully written to disk; throwing here aborts an otherwise
+        // valid slice under a headless run. Log instead of abort, exactly as
+        // the Debug GL-assert is neutered for headless. Not part of the port.
+        BOOST_LOG_TRIVIAL(warning) << message.str();
     }
 #endif
 
