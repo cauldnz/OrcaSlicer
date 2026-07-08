@@ -582,7 +582,7 @@ void register_object_model(py::module_ &m)
             for (auto handle : changes) {
                 py::dict d = handle.cast<py::dict>();
                 CustomGCode::Item item;
-                item.type = CustomGCode::ColorChange;
+                item.type = CustomGCode::ToolChange;
                 if (!d.contains("z"))
                     throw std::runtime_error("each colour change needs a 'z' (print_z)");
                 item.print_z = d["z"].cast<double>();
@@ -778,6 +778,28 @@ void register_object_model(py::module_ &m)
             return PyConfig{ConfigSource::Printer};
         })
         // ---- M3 slicing ---------------------------------------------------
+        // Set up N project filaments with the given colours (UI-parity: the
+        // Sidebar "+" add-filament path). Colours are "#RRGGBB". Enables
+        // multi-colour prints; build_ams_mapping matches these to AMS slots.
+        .def("set_filaments", [](const PyDocument &, py::list colors) {
+            auto *plater = plater_or_throw("Document.set_filaments");
+            auto *pb = GUI::wxGetApp().preset_bundle;
+            const unsigned int n = (unsigned int) colors.size();
+            if (n < 1 || n > 16) throw std::runtime_error("filament count must be 1..16");
+            GUI::Plater::TakeSnapshot snap(plater, std::string("API: set filaments"));
+            pb->set_num_filaments(n);
+            std::vector<std::string> cols;
+            for (auto c : colors) {
+                std::string h = c.cast<std::string>();
+                if (!h.empty() && h[0] != '#') h = "#" + h;
+                cols.push_back(h);
+            }
+            if (auto *opt = pb->project_config.option<ConfigOptionStrings>("filament_colour"))
+                opt->values = cols;
+            plater->on_filament_count_change(n);
+            plater->on_config_change(pb->full_config());   // schedule reslice (not via Tab)
+            return int(n);
+        }, py::arg("colors"))
         .def("slice", [](const PyDocument &, py::object plate) {
             auto *plater = plater_or_throw("Document.slice");
             auto &list = plater->get_partplate_list();
