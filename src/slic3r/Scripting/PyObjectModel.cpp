@@ -112,8 +112,8 @@ struct PyPlateList {};
 struct PyPlate    { int idx; };
 
 // Which config a PyConfig fronts.
-enum class ConfigSource { Global, Print, Filament, Printer, Plate, Object };
-struct PyConfig { ConfigSource source; int plate_idx = 0; };
+enum class ConfigSource { Global, Print, Filament, Printer, Plate, Object, Volume };
+struct PyConfig { ConfigSource source; int plate_idx = 0; int vol_idx = 0; };
 
 // M3 slicing handles.
 struct PySliceJob { int plate_idx; };
@@ -180,6 +180,13 @@ const ConfigBase *resolve_config(const PyConfig &c, const char *what)
         GUI::PartPlate *plate = plate_or_throw(c.plate_idx, what);
         if (plate->config() == nullptr) throw std::runtime_error("no plate config");
         return plate->config();
+    }
+    case ConfigSource::Volume: {
+        // per-volume overrides (ModelVolume::config); plate_idx=object, vol_idx=volume.
+        ModelObject *obj = object_at(c.plate_idx, what);
+        if (size_t(c.vol_idx) >= obj->volumes.size())
+            throw std::runtime_error("volume index out of range");
+        return &obj->volumes[c.vol_idx]->config.get();
     }
     case ConfigSource::Object: {
         // per-object overrides (ModelObject::config); plate_idx = object index.
@@ -271,6 +278,15 @@ void register_object_model(py::module_ &m)
                 plater->schedule_background_process();
                 return;
             }
+            if (c.source == ConfigSource::Volume) {
+                ModelObject *obj = object_at(c.plate_idx, "Config.set");
+                if (size_t(c.vol_idx) >= obj->volumes.size())
+                    throw std::runtime_error("volume index out of range");
+                ConfigSubstitutionContext ctx(ForwardCompatibilitySubstitutionRule::EnableSilent);
+                obj->volumes[c.vol_idx]->config.set_deserialize(key, value, ctx);
+                plater->changed_object(int(c.plate_idx));
+                return;
+            }
             if (c.source == ConfigSource::Object) {
                 ModelObject *obj = object_at(c.plate_idx, "Config.set");
                 ConfigSubstitutionContext ctx(ForwardCompatibilitySubstitutionRule::EnableSilent);
@@ -321,6 +337,10 @@ void register_object_model(py::module_ &m)
         })
         .def_property_readonly("is_model_part", [](const PyVolume &v) {
             return volume_at(v, "Volume.is_model_part")->is_model_part();
+        })
+        .def_property_readonly("config", [](const PyVolume &v) {
+            (void) volume_at(v, "Volume.config");   // bounds-check
+            return PyConfig{ConfigSource::Volume, int(v.obj_idx), int(v.vol_idx)};
         });
 
     // ---- Object -----------------------------------------------------------
