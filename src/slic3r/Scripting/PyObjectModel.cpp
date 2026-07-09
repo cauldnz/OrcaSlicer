@@ -36,6 +36,7 @@
 #include "libslic3r/Format/bbs_3mf.hpp"        // LoadStrategy
 #include "libslic3r/CustomGCode.hpp"      // colour-change-by-height
 #include "slic3r/GUI/GUI_App.hpp"
+#include <pybind11/eval.h>                  // py::exec (download helper)
 #include "slic3r/GUI/Plater.hpp"
 #include "slic3r/GUI/PartPlate.hpp"
 #include "slic3r/GUI/Tab.hpp"
@@ -111,7 +112,7 @@ struct PyPlateList {};
 struct PyPlate    { int idx; };
 
 // Which config a PyConfig fronts.
-enum class ConfigSource { Global, Print, Filament, Printer, Plate };
+enum class ConfigSource { Global, Print, Filament, Printer, Plate, Object };
 struct PyConfig { ConfigSource source; int plate_idx = 0; };
 
 // M3 slicing handles.
@@ -179,6 +180,10 @@ const ConfigBase *resolve_config(const PyConfig &c, const char *what)
         GUI::PartPlate *plate = plate_or_throw(c.plate_idx, what);
         if (plate->config() == nullptr) throw std::runtime_error("no plate config");
         return plate->config();
+    }
+    case ConfigSource::Object: {
+        // per-object overrides (ModelObject::config); plate_idx = object index.
+        return &object_at(c.plate_idx, what)->config.get();
     }
     }
     throw std::runtime_error("unknown config source");
@@ -266,6 +271,13 @@ void register_object_model(py::module_ &m)
                 plater->schedule_background_process();
                 return;
             }
+            if (c.source == ConfigSource::Object) {
+                ModelObject *obj = object_at(c.plate_idx, "Config.set");
+                ConfigSubstitutionContext ctx(ForwardCompatibilitySubstitutionRule::EnableSilent);
+                obj->config.set_deserialize(key, value, ctx);
+                plater->changed_object(int(c.plate_idx));
+                return;
+            }
             PresetCollection *col = preset_collection(c.source);
             DynamicPrintConfig &cfg = col->get_edited_preset().config;
             if (!cfg.has(key))
@@ -326,6 +338,10 @@ void register_object_model(py::module_ &m)
             for (size_t i = 0; i < obj->volumes.size(); ++i)
                 out.append(PyVolume{o.idx, i});
             return out;
+        })
+        .def_property_readonly("config", [](const PyObject &o) {
+            (void) object_at(o.idx, "Object.config");   // bounds-check
+            return PyConfig{ConfigSource::Object, int(o.idx)};
         })
         .def("bounding_box", [](const PyObject &o) {
             const BoundingBoxf3 &bb = object_at(o.idx, "Object.bounding_box")->bounding_box_approx();
@@ -871,6 +887,76 @@ void register_object_model(py::module_ &m)
         });
 
     m.attr("app") = py::cast(PyApp{});
+
+    // MakerWorld model download — Python (urllib) transport to navigate
+    // Cloudflare (which fingerprints/blocks libcurl). Reuses the C++ auth
+    // primitive device.request_bind_ticket(). Exposed as pyslic3r.download_model.
+    {
+        py::dict ns;
+        py::exec(R"PYSRC(
+def download_model(url_or_id, instance_id=None, out_dir=None, retries=4):
+    """Download a MakerWorld model's 3mf via the logged-in Bambu account.
+    url_or_id: MakerWorld URL (…/models/<design>…#profileId-<instance>) or design id.
+    Returns {name, path, size, design_id, instance_id}. Navigates Cloudflare via
+    Python's TLS (native libcurl is blocked); retries transient 403/429/5xx."""
+    import pyslic3r as _ps, urllib.request, urllib.parse, http.cookiejar, json, os, re, tempfile, time
+    dev = _ps.app.device
+    if not dev.is_logged_in:
+        raise RuntimeError("download_model: not logged in to a Bambu account")
+    design_id, inst = None, instance_id
+    m = re.search(r"/models/(\d+)", str(url_or_id))
+    if m:
+        design_id = m.group(1)
+    m = re.search(r"profileId-(\d+)", str(url_or_id))
+    if m and inst is None:
+        inst = m.group(1)
+    if design_id is None:
+        design_id = str(url_or_id)
+    if inst is None:
+        raise RuntimeError("download_model: need instance_id= or a URL containing #profileId-<id>")
+    host = "https://makerworld.com/"
+    hdrs = {"User-Agent": "BambuStudio", "accept": "*/*"}
+    TRANSIENT = (403, 429, 500, 502, 503, 504)
+    err = None
+    for attempt in range(max(1, retries)):
+        try:
+            ticket = dev.request_bind_ticket()
+            if not ticket:
+                raise RuntimeError("request_bind_ticket failed (login/session?)")
+            f3mf = host + "api/v1/design-service/instance/%s/f3mf" % inst
+            signin = host + "api/sign-in/ticket?to=" + urllib.parse.quote(f3mf, safe="") + "&ticket=" + ticket
+            cj = http.cookiejar.CookieJar()
+            op = urllib.request.build_opener(urllib.request.HTTPCookieProcessor(cj))
+            meta = op.open(urllib.request.Request(signin, headers=hdrs), timeout=60).read()
+            j = json.loads(meta)
+            cdn = j.get("url")
+            name = j.get("name") or ("model_%s.3mf" % inst)
+            if not cdn:
+                raise RuntimeError("could not resolve file url: %r" % meta[:160])
+            data = op.open(urllib.request.Request(cdn, headers=hdrs), timeout=180).read()
+            if not data:
+                raise RuntimeError("downloaded file is empty")
+            d = out_dir or tempfile.gettempdir()
+            os.makedirs(d, exist_ok=True)
+            path = os.path.join(d, name)
+            with open(path, "wb") as f:
+                f.write(data)
+            return {"name": name, "path": path, "size": len(data),
+                    "design_id": design_id, "instance_id": inst}
+        except urllib.error.HTTPError as e:
+            err = e
+            if e.code in TRANSIENT and attempt < retries - 1:
+                time.sleep(1.5 * (2 ** attempt)); continue
+            raise RuntimeError("download_model: HTTP %s from MakerWorld (Cloudflare?)" % e.code)
+        except Exception as e:
+            err = e
+            if attempt < retries - 1:
+                time.sleep(1.5 * (2 ** attempt)); continue
+            raise
+    raise RuntimeError("download_model failed after %d attempts: %s" % (retries, err))
+)PYSRC", ns, ns);
+        m.attr("download_model") = ns["download_model"];
+    }
 }
 
 } // namespace pyslic3r
