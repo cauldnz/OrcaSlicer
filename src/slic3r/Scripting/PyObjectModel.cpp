@@ -39,6 +39,7 @@
 #include "slic3r/GUI/GUI_App.hpp"
 #include <pybind11/eval.h>                  // py::exec (download helper)
 #include "slic3r/GUI/Plater.hpp"
+#include "libslic3r/CutUtils.hpp"   // Cut class + ModelObjectCutAttribute (reworked cut)
 #include "slic3r/GUI/GLCanvas3D.hpp"   // canvas3D()->get_selection()
 #include "slic3r/GUI/Selection.hpp"     // Selection::add_object (headless select)
 #include "slic3r/GUI/PartPlate.hpp"
@@ -589,6 +590,24 @@ void register_object_model(py::module_ &m)
             plater_or_throw("Object.split")->split_object();
             return model_or_throw("Object.split").objects.size();
         })
+        .def("cut", [](const PyObject &o, double z, bool keep_upper, bool keep_lower) {
+            main_thread("Object.cut");
+            if (!keep_upper && !keep_lower)
+                throw std::runtime_error("cut: keep_upper and keep_lower are both false");
+            auto *plater = plater_or_throw("Object.cut");
+            ModelObject *obj = object_at(o.idx, "Object.cut");
+            if (obj->instances.empty())
+                throw std::runtime_error("cut: object has no instances");
+            const Vec3d off = obj->instances[0]->get_offset();
+            ModelObjectCutAttributes attrs =
+                only_if(keep_upper, ModelObjectCutAttribute::KeepUpper) |
+                only_if(keep_lower, ModelObjectCutAttribute::KeepLower);
+            Transform3d cut_matrix = Geometry::translation_transform(Vec3d(0.0, 0.0, z - off.z()));
+            Slic3r::Cut cut(obj, 0, cut_matrix, attrs);
+            const ModelObjectPtrs &new_objects = cut.perform_with_plane();
+            plater->apply_cut_object_to_model(o.idx, new_objects);
+            return model_or_throw("Object.cut").objects.size();
+        }, py::arg("z"), py::arg("keep_upper") = true, py::arg("keep_lower") = true)
         .def("place_on_bed", [](const PyObject &o) {
             auto *plater = plater_or_throw("Object.place_on_bed");
             ModelObject *obj = object_at(o.idx, "Object.place_on_bed");
