@@ -105,6 +105,17 @@ const char *volume_type_str(ModelVolumeType t)
     }
 }
 
+ModelVolumeType volume_type_from_str(const std::string &s)
+{
+    if (s == "part"    || s == "model_part")         return ModelVolumeType::MODEL_PART;
+    if (s == "modifier"|| s == "parameter_modifier") return ModelVolumeType::PARAMETER_MODIFIER;
+    if (s == "negative"|| s == "negative_volume")    return ModelVolumeType::NEGATIVE_VOLUME;
+    if (s == "support_blocker"  || s == "blocker")   return ModelVolumeType::SUPPORT_BLOCKER;
+    if (s == "support_enforcer" || s == "enforcer")  return ModelVolumeType::SUPPORT_ENFORCER;
+    throw std::runtime_error("unknown volume type '" + s +
+        "' (part/modifier/negative/support_blocker/support_enforcer)");
+}
+
 // ---- handle types ---------------------------------------------------------
 // Each holds indices only; the referenced C++ object is re-resolved per call.
 
@@ -652,6 +663,22 @@ void register_object_model(py::module_ &m)
             plater->apply_cut_object_to_model(o.idx, new_objects);
             return model_or_throw("Object.cut").objects.size();
         }, py::arg("z"), py::arg("keep_upper") = true, py::arg("keep_lower") = true)
+        .def("add_part", [](const PyObject &o, const std::string &path,
+                            const std::string &type_name) {
+            main_thread("Object.add_part");
+            auto *plater = plater_or_throw("Object.add_part");
+            ModelObject *obj = object_at(o.idx, "Object.add_part");
+            const ModelVolumeType type = volume_type_from_str(type_name);
+            TriangleMesh mesh;
+            if (!mesh.ReadSTLFile(path.c_str()) || mesh.empty())
+                throw std::runtime_error("add_part: could not read a mesh (STL expected): " + path);
+            GUI::Plater::TakeSnapshot snap(plater, std::string("API: add part"));
+            ModelVolume *v = obj->add_volume(std::move(mesh), type);
+            v->name = boost::filesystem::path(path).stem().string();
+            obj->invalidate_bounding_box();
+            plater->changed_object(int(o.idx));
+            return int(obj->volumes.size() - 1);   // index of the new volume
+        }, py::arg("path"), py::arg("type") = "part")
         .def("place_on_bed", [](const PyObject &o) {
             auto *plater = plater_or_throw("Object.place_on_bed");
             ModelObject *obj = object_at(o.idx, "Object.place_on_bed");
