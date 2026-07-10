@@ -27,6 +27,7 @@
 
 #include "libslic3r/libslic3r.h"
 #include "libslic3r/Model.hpp"
+#include "libslic3r/Shape/TextShape.hpp"   // load_text_shape / TextResult (editable text)
 #include "libslic3r/BoundingBox.hpp"
 #include "libslic3r/Config.hpp"
 #include "libslic3r/Preset.hpp"
@@ -108,6 +109,7 @@ struct PyDocument {};
 struct PyModel {};
 struct PyObject   { size_t idx; };
 struct PyVolume   { size_t obj_idx; size_t vol_idx; };
+struct PyText     { size_t obj_idx; size_t vol_idx; };
 struct PyPlateList {};
 struct PyPlate    { int idx; };
 
@@ -202,6 +204,34 @@ ModelVolume *volume_at(const PyVolume &v, const char *what)
     if (v.vol_idx >= obj->volumes.size())
         throw std::runtime_error("volume index out of range (model changed?)");
     return obj->volumes[v.vol_idx];
+}
+
+// Resolve a text handle -> ModelVolume, asserting it is editable text.
+ModelVolume *text_at(const PyText &t, const char *what)
+{
+    ModelVolume *v = volume_at(PyVolume{t.obj_idx, t.vol_idx}, what);
+    if (!v->is_text())
+        throw std::runtime_error(std::string(what) + ": volume is not editable text");
+    return v;
+}
+
+// Map Orca text_configuration -> load_text_shape() params. Depth (thickness)
+// is taken from the current mesh Z extent (Orca stores no depth on the style).
+static void _orca_text_params(ModelVolume *v, std::string &text, std::string &font,
+                              float &size, float &depth, bool &bold, bool &italic)
+{
+    const TextConfiguration &tc = *v->text_configuration;
+    const FontProp &fp = tc.style.prop;
+    text = tc.text;
+    font = fp.face_name.has_value() ? *fp.face_name : tc.style.name;   // actual face, not style name
+    if (font.empty()) font = "NotoSans";               // OCCT fallback
+    size = fp.size_in_mm;
+    depth = (float) v->mesh().bounding_box().size().z();
+    if (!(depth > 0.f)) depth = 1.f;
+    bold = (fp.weight.has_value() && fp.weight->find("bold") != std::string::npos)
+        || (fp.boldness.has_value() && *fp.boldness > 0.f);
+    italic = (fp.style.has_value() && fp.style->find("italic") != std::string::npos)
+        || (fp.skew.has_value() && (*fp.skew < -1e-3f || *fp.skew > 1e-3f));
 }
 
 // Read slice stats off a sliced plate into a PySliceResult. Main thread.
@@ -343,6 +373,76 @@ void register_object_model(py::module_ &m)
             return PyConfig{ConfigSource::Volume, int(v.obj_idx), int(v.vol_idx)};
         });
 
+    // ---- Text (editable emboss text; Orca text_configuration + load_text_shape) ----
+    py::class_<PyText>(m, "Text")
+        .def_property_readonly("text", [](const PyText &t) {
+            return text_at(t, "Text.text")->text_configuration->text;
+        })
+        .def_property_readonly("font_name", [](const PyText &t) {
+            { const EmbossStyle &st = text_at(t, "Text.font_name")->text_configuration->style; return st.prop.face_name.has_value() ? *st.prop.face_name : st.name; }
+        })
+        .def_property_readonly("font_size", [](const PyText &t) {
+            return text_at(t, "Text.font_size")->text_configuration->style.prop.size_in_mm;
+        })
+        .def_property_readonly("width", [](const PyText &t) {
+            ModelVolume *v = text_at(t, "Text.width");
+            std::string text, font; float size, depth; bool bold, italic;
+            _orca_text_params(v, text, font, size, depth, bold, italic);
+            TextResult r;
+            load_text_shape(text.c_str(), font.c_str(), size, depth, bold, italic, r);
+            return r.text_width;
+        })
+        .def("set_text", [](const PyText &t, const std::string &new_text,
+                            bool fit, py::object max_width) -> py::object {
+            main_thread("Text.set_text");
+            ModelObject *obj = object_at(t.obj_idx, "Text.set_text");
+            ModelVolume *vol = text_at(t, "Text.set_text");
+            std::string text, font; float size, depth; bool bold, italic;
+            _orca_text_params(vol, text, font, size, depth, bold, italic);
+
+            double target_w;
+            if (!max_width.is_none()) {
+                target_w = max_width.cast<double>();
+            } else {
+                TextResult orig;
+                load_text_shape(text.c_str(), font.c_str(), size, depth, bold, italic, orig);
+                target_w = orig.text_width;
+            }
+            TextResult r;
+            load_text_shape(new_text.c_str(), font.c_str(), size, depth, bold, italic, r);
+            bool fitted = false;
+            if (fit && r.text_width > target_w && r.text_width > 0.0) {
+                size = (float)(size * (target_w / r.text_width));
+                load_text_shape(new_text.c_str(), font.c_str(), size, depth, bold, italic, r);
+                fitted = true;
+            }
+            if (r.text_mesh.empty())
+                throw std::runtime_error("Text.set_text: mesh generation failed (font missing?)");
+
+            TextConfiguration tc = *vol->text_configuration;   // copy + update
+            tc.text = new_text;
+            tc.style.prop.size_in_mm = size;
+
+            GUI::wxGetApp().plater()->take_snapshot("Edit Text");
+            Geometry::Transformation tran = vol->get_transformation();
+            ModelVolume *nv = obj->add_volume(r.text_mesh, false);
+            nv->calculate_convex_hull();
+            nv->set_transformation(tran.get_matrix());
+            nv->text_configuration = tc;
+            nv->name = vol->name;
+            nv->set_type(vol->type());
+            nv->config.apply(vol->config);
+            std::swap(obj->volumes[t.vol_idx], obj->volumes.back());
+            obj->delete_volume(obj->volumes.size() - 1);
+            obj->invalidate_bounding_box();
+            GUI::wxGetApp().plater()->changed_object(int(t.obj_idx));
+
+            py::dict d;
+            d["text"] = new_text; d["font_size"] = size; d["width"] = r.text_width;
+            d["fit_target"] = target_w; d["fitted"] = fitted;
+            return d;
+        }, py::arg("text"), py::arg("fit") = true, py::arg("max_width") = py::none());
+
     // ---- Object -----------------------------------------------------------
     py::class_<PyObject>(m, "Object")
         .def_property_readonly("name", [](const PyObject &o) {
@@ -357,6 +457,14 @@ void register_object_model(py::module_ &m)
             py::list out;
             for (size_t i = 0; i < obj->volumes.size(); ++i)
                 out.append(PyVolume{o.idx, i});
+            return out;
+        })
+        .def("texts", [](const PyObject &o) {
+            ModelObject *obj = object_at(o.idx, "Object.texts");
+            py::list out;
+            for (size_t i = 0; i < obj->volumes.size(); ++i)
+                if (obj->volumes[i]->is_text())
+                    out.append(PyText{o.idx, i});
             return out;
         })
         .def_property_readonly("config", [](const PyObject &o) {
