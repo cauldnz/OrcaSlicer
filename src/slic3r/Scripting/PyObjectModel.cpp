@@ -377,6 +377,29 @@ void register_object_model(py::module_ &m)
                 throw std::runtime_error("selected_preset only on print/filament/printer config");
             return col->get_selected_preset_name();
         })
+        .def("save_preset", [](const PyConfig &c, const std::string &name) {
+            main_thread("Config.save_preset");
+            if (name.empty()) throw std::runtime_error("save_preset: empty name");
+            PresetCollection *col = preset_collection(c.source);
+            if (col == nullptr)
+                throw std::runtime_error("save_preset only on print/filament/printer config");
+            col->save_current_preset(name);   // current edited config -> named user preset
+            return name;
+        }, py::arg("name"))
+        .def("delete_preset", [](const PyConfig &c, const std::string &name) {
+            main_thread("Config.delete_preset");
+            auto *plater = plater_or_throw("Config.delete_preset");
+            PresetCollection *col = preset_collection(c.source);
+            if (col == nullptr)
+                throw std::runtime_error("delete_preset only on print/filament/printer config");
+            col->select_preset_by_name(name, true);   // force-select the target
+            if (col->get_selected_preset_name() != name)
+                throw std::runtime_error("delete_preset: preset not found: " + name);
+            if (!col->delete_current_preset())
+                throw std::runtime_error("delete_preset: cannot delete (default/system/in-use): " + name);
+            plater->on_config_change(GUI::wxGetApp().preset_bundle->full_config());
+            return name;
+        }, py::arg("name"))
         .def("apply_preset", [](const PyConfig &c, const std::string &name, bool force) {
             // Select a named preset via the Tab — the same path the preset
             // dropdown uses (compatibility checks, dependent tabs, dirty, and
