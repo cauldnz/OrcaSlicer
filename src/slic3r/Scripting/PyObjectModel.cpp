@@ -27,6 +27,7 @@
 
 #include "libslic3r/libslic3r.h"
 #include "libslic3r/Model.hpp"
+#include "libslic3r/Format/STL.hpp"   // store_stl (export_stl)
 #include "libslic3r/Shape/TextShape.hpp"   // load_text_shape / TextResult (editable text)
 #include "libslic3r/BoundingBox.hpp"
 #include "libslic3r/Config.hpp"
@@ -1048,6 +1049,34 @@ void register_object_model(py::module_ &m)
             return path;
         }, py::arg("path"))
         // Save the project as a .3mf (UI-parity: Save Project).
+        // Export the arranged geometry as STL (UI-parity: Export -> STL, but
+        // without the file dialog). Combined transformed mesh over model parts.
+        .def("export_stl", [](const PyDocument &, const std::string &path, bool binary) {
+            main_thread("Document.export_stl");
+            Model &model = model_or_throw("Document.export_stl");
+            if (model.objects.empty())
+                throw std::runtime_error("export_stl: no objects to export");
+            TriangleMesh out;
+            for (const ModelObject *mo : model.objects) {
+                TriangleMesh obj_mesh;
+                for (const ModelVolume *v : mo->volumes)
+                    if (v->is_model_part()) {
+                        TriangleMesh vm(v->mesh());
+                        vm.transform(v->get_matrix(), true);
+                        obj_mesh.merge(vm);
+                    }
+                for (const ModelInstance *inst : mo->instances) {
+                    TriangleMesh m(obj_mesh);
+                    m.transform(inst->get_matrix(), true);
+                    out.merge(m);
+                }
+            }
+            if (out.empty())
+                throw std::runtime_error("export_stl: combined mesh is empty");
+            if (!Slic3r::store_stl(path.c_str(), &out, binary))
+                throw std::runtime_error("export_stl: write failed: " + path);
+            return path;
+        }, py::arg("path"), py::arg("binary") = true)
         .def("save_3mf", [](const PyDocument &, const std::string &path) {
             namespace fs = boost::filesystem;
             auto *plater = plater_or_throw("Document.save_3mf");
