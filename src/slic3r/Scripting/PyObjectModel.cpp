@@ -39,6 +39,8 @@
 #include "slic3r/GUI/GUI_App.hpp"
 #include <pybind11/eval.h>                  // py::exec (download helper)
 #include "slic3r/GUI/Plater.hpp"
+#include "slic3r/GUI/GLCanvas3D.hpp"   // canvas3D()->get_selection()
+#include "slic3r/GUI/Selection.hpp"     // Selection::add_object (headless select)
 #include "slic3r/GUI/PartPlate.hpp"
 #include "slic3r/GUI/Tab.hpp"
 #include "slic3r/GUI/BackgroundSlicingProcess.hpp"   // job.cancel() -> stop()
@@ -277,6 +279,16 @@ void fill_slice_result(int plate_idx, PySliceResult &res)
         if (res.total_weight <= 0.0)   // fallback: sum per-extruder filament_g
             for (const auto &_kv : res.filament_g) res.total_weight += _kv.second;
     }
+}
+
+// Point the GUI selection at a single object (headless) — the seam the
+// selection-based Plater ops (fill_bed, split) bind to. Mirrors a click.
+static void _select_only(size_t obj_idx, const char *what)
+{
+    (void) object_at(obj_idx, what);   // bounds-check
+    GUI::Selection &sel = plater_or_throw(what)->canvas3D()->get_selection();
+    sel.clear();
+    sel.add_object((unsigned int) obj_idx, true);
 }
 
 } // anonymous namespace
@@ -571,6 +583,12 @@ void register_object_model(py::module_ &m)
             return d;
         })
         // ---- geometry finish (UI-parity: drop-to-bed, scale-to-fit, rename) --
+        .def("split", [](const PyObject &o) {
+            main_thread("Object.split");
+            _select_only(o.idx, "Object.split");
+            plater_or_throw("Object.split")->split_object();
+            return model_or_throw("Object.split").objects.size();
+        })
         .def("place_on_bed", [](const PyObject &o) {
             auto *plater = plater_or_throw("Object.place_on_bed");
             ModelObject *obj = object_at(o.idx, "Object.place_on_bed");
