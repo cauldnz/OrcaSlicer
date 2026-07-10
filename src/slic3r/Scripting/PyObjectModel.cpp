@@ -988,6 +988,10 @@ void register_object_model(py::module_ &m)
             main_thread("app.version");
             return std::string(SLIC3R_VERSION);
         })
+        .def_property_readonly("name", [](const PyApp &) {
+            main_thread("app.name");
+            return std::string(SLIC3R_APP_NAME);   // BambuStudio / OrcaSlicer / PrusaSlicer
+        })
         .def_property_readonly("active_document", [](const PyApp &) -> py::object {
             main_thread("app.active_document");
             if (GUI::wxGetApp().plater() == nullptr)
