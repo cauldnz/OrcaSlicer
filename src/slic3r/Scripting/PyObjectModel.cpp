@@ -1077,6 +1077,19 @@ void register_object_model(py::module_ &m)
                 throw std::runtime_error("export_stl: write failed: " + path);
             return path;
         }, py::arg("path"), py::arg("binary") = true)
+        // Open a full 3MF project: geometry + its embedded config (unlike
+        // model.add, which loads geometry only). Does not clear the scene —
+        // call model.clear() first for a clean replace.
+        .def("open_project", [](const PyDocument &, const std::string &path) {
+            auto *plater = plater_or_throw("Document.open_project");
+            GUI::Plater::TakeSnapshot snap(plater, std::string("API: open project"));
+            std::vector<boost::filesystem::path> paths{ boost::filesystem::path(path) };
+            plater->load_files(paths,
+                LoadStrategy::LoadModel | LoadStrategy::LoadConfig |
+                LoadStrategy::AddDefaultInstances | LoadStrategy::Silence,
+                /*ask_multi=*/false);
+            return plater->model().objects.size();
+        }, py::arg("path"))
         .def("save_3mf", [](const PyDocument &, const std::string &path) {
             namespace fs = boost::filesystem;
             auto *plater = plater_or_throw("Document.save_3mf");
