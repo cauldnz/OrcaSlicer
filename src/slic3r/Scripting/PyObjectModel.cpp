@@ -359,6 +359,23 @@ void register_object_model(py::module_ &m)
             col->update_dirty();                 // mark preset dirty like the GUI
             plater->on_config_change(cfg);        // diff + schedule reslice
         }, py::arg("key"), py::arg("value"))
+        .def("presets", [](const PyConfig &c) {
+            main_thread("Config.presets");
+            PresetCollection *col = preset_collection(c.source);
+            if (col == nullptr)
+                throw std::runtime_error("presets() only on print/filament/printer config");
+            py::list out;
+            for (const Preset &p : col->get_presets())
+                if (p.is_visible && p.is_compatible) out.append(p.name);   // selectable set
+            return out;
+        })
+        .def_property_readonly("selected_preset", [](const PyConfig &c) {
+            main_thread("Config.selected_preset");
+            PresetCollection *col = preset_collection(c.source);
+            if (col == nullptr)
+                throw std::runtime_error("selected_preset only on print/filament/printer config");
+            return col->get_selected_preset_name();
+        })
         .def("apply_preset", [](const PyConfig &c, const std::string &name, bool force) {
             // Select a named preset via the Tab — the same path the preset
             // dropdown uses (compatibility checks, dependent tabs, dirty, and
@@ -375,13 +392,16 @@ void register_object_model(py::module_ &m)
             auto *plater = plater_or_throw("Config.apply_preset");
             PresetCollection *col = preset_collection(c.source);
             if (col == nullptr) throw std::runtime_error("no preset collection for this config");
-            const bool ok = col->select_preset_by_name(name, force);
-            if (!ok && !force)
-                throw std::runtime_error("preset not applied (not found or incompatible): " + name);
+            col->select_preset_by_name(name, force);
             PresetBundle *pb = GUI::wxGetApp().preset_bundle;
             pb->update_compatible(PresetSelectCompatibleType::Always);
             col->update_dirty();
             plater->on_config_change(pb->full_config());
+            // Verify the END STATE, not select_preset_by_name's return: it returns
+            // false when the preset is already selected, and update_compatible reverts
+            // an incompatible one — so the real test is whether the target is selected.
+            if (!force && col->get_selected_preset_name() != name)
+                throw std::runtime_error("preset not applied (not found or incompatible): " + name);
         }, py::arg("name"), py::arg("force") = false);
 
     // ---- Volume -----------------------------------------------------------
