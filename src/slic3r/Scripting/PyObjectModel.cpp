@@ -27,6 +27,7 @@
 
 #include "libslic3r/libslic3r.h"
 #include "libslic3r/Model.hpp"
+#include "libslic3r/Shape/TextShape.hpp"   // load_text_shape / TextResult (editable text)
 #include "libslic3r/BoundingBox.hpp"
 #include "libslic3r/Config.hpp"
 #include "libslic3r/Preset.hpp"
@@ -36,6 +37,7 @@
 #include "libslic3r/Format/bbs_3mf.hpp"        // LoadStrategy
 #include "libslic3r/CustomGCode.hpp"      // colour-change-by-height
 #include "slic3r/GUI/GUI_App.hpp"
+#include <pybind11/eval.h>                  // py::exec (download helper)
 #include "slic3r/GUI/Plater.hpp"
 #include "slic3r/GUI/PartPlate.hpp"
 #include "slic3r/GUI/Tab.hpp"
@@ -107,12 +109,13 @@ struct PyDocument {};
 struct PyModel {};
 struct PyObject   { size_t idx; };
 struct PyVolume   { size_t obj_idx; size_t vol_idx; };
+struct PyText     { size_t obj_idx; size_t vol_idx; };
 struct PyPlateList {};
 struct PyPlate    { int idx; };
 
 // Which config a PyConfig fronts.
-enum class ConfigSource { Global, Print, Filament, Printer, Plate };
-struct PyConfig { ConfigSource source; int plate_idx = 0; };
+enum class ConfigSource { Global, Print, Filament, Printer, Plate, Object, Volume };
+struct PyConfig { ConfigSource source; int plate_idx = 0; int vol_idx = 0; };
 
 // M3 slicing handles.
 struct PySliceJob { int plate_idx; };
@@ -180,6 +183,17 @@ const ConfigBase *resolve_config(const PyConfig &c, const char *what)
         if (plate->config() == nullptr) throw std::runtime_error("no plate config");
         return plate->config();
     }
+    case ConfigSource::Volume: {
+        // per-volume overrides (ModelVolume::config); plate_idx=object, vol_idx=volume.
+        ModelObject *obj = object_at(c.plate_idx, what);
+        if (size_t(c.vol_idx) >= obj->volumes.size())
+            throw std::runtime_error("volume index out of range");
+        return &obj->volumes[c.vol_idx]->config.get();
+    }
+    case ConfigSource::Object: {
+        // per-object overrides (ModelObject::config); plate_idx = object index.
+        return &object_at(c.plate_idx, what)->config.get();
+    }
     }
     throw std::runtime_error("unknown config source");
 }
@@ -190,6 +204,34 @@ ModelVolume *volume_at(const PyVolume &v, const char *what)
     if (v.vol_idx >= obj->volumes.size())
         throw std::runtime_error("volume index out of range (model changed?)");
     return obj->volumes[v.vol_idx];
+}
+
+// Resolve a text handle -> ModelVolume, asserting it is editable text.
+ModelVolume *text_at(const PyText &t, const char *what)
+{
+    ModelVolume *v = volume_at(PyVolume{t.obj_idx, t.vol_idx}, what);
+    if (!v->is_text())
+        throw std::runtime_error(std::string(what) + ": volume is not editable text");
+    return v;
+}
+
+// Map Orca text_configuration -> load_text_shape() params. Depth (thickness)
+// is taken from the current mesh Z extent (Orca stores no depth on the style).
+static void _orca_text_params(ModelVolume *v, std::string &text, std::string &font,
+                              float &size, float &depth, bool &bold, bool &italic)
+{
+    const TextConfiguration &tc = *v->text_configuration;
+    const FontProp &fp = tc.style.prop;
+    text = tc.text;
+    font = fp.face_name.has_value() ? *fp.face_name : tc.style.name;   // actual face, not style name
+    if (font.empty()) font = "NotoSans";               // OCCT fallback
+    size = fp.size_in_mm;
+    depth = (float) v->mesh().bounding_box().size().z();
+    if (!(depth > 0.f)) depth = 1.f;
+    bold = (fp.weight.has_value() && fp.weight->find("bold") != std::string::npos)
+        || (fp.boldness.has_value() && *fp.boldness > 0.f);
+    italic = (fp.style.has_value() && fp.style->find("italic") != std::string::npos)
+        || (fp.skew.has_value() && (*fp.skew < -1e-3f || *fp.skew > 1e-3f));
 }
 
 // Read slice stats off a sliced plate into a PySliceResult. Main thread.
@@ -266,6 +308,22 @@ void register_object_model(py::module_ &m)
                 plater->schedule_background_process();
                 return;
             }
+            if (c.source == ConfigSource::Volume) {
+                ModelObject *obj = object_at(c.plate_idx, "Config.set");
+                if (size_t(c.vol_idx) >= obj->volumes.size())
+                    throw std::runtime_error("volume index out of range");
+                ConfigSubstitutionContext ctx(ForwardCompatibilitySubstitutionRule::EnableSilent);
+                obj->volumes[c.vol_idx]->config.set_deserialize(key, value, ctx);
+                plater->changed_object(int(c.plate_idx));
+                return;
+            }
+            if (c.source == ConfigSource::Object) {
+                ModelObject *obj = object_at(c.plate_idx, "Config.set");
+                ConfigSubstitutionContext ctx(ForwardCompatibilitySubstitutionRule::EnableSilent);
+                obj->config.set_deserialize(key, value, ctx);
+                plater->changed_object(int(c.plate_idx));
+                return;
+            }
             PresetCollection *col = preset_collection(c.source);
             DynamicPrintConfig &cfg = col->get_edited_preset().config;
             if (!cfg.has(key))
@@ -309,7 +367,81 @@ void register_object_model(py::module_ &m)
         })
         .def_property_readonly("is_model_part", [](const PyVolume &v) {
             return volume_at(v, "Volume.is_model_part")->is_model_part();
+        })
+        .def_property_readonly("config", [](const PyVolume &v) {
+            (void) volume_at(v, "Volume.config");   // bounds-check
+            return PyConfig{ConfigSource::Volume, int(v.obj_idx), int(v.vol_idx)};
         });
+
+    // ---- Text (editable emboss text; Orca text_configuration + load_text_shape) ----
+    py::class_<PyText>(m, "Text")
+        .def_property_readonly("text", [](const PyText &t) {
+            return text_at(t, "Text.text")->text_configuration->text;
+        })
+        .def_property_readonly("font_name", [](const PyText &t) {
+            { const EmbossStyle &st = text_at(t, "Text.font_name")->text_configuration->style; return st.prop.face_name.has_value() ? *st.prop.face_name : st.name; }
+        })
+        .def_property_readonly("font_size", [](const PyText &t) {
+            return text_at(t, "Text.font_size")->text_configuration->style.prop.size_in_mm;
+        })
+        .def_property_readonly("width", [](const PyText &t) {
+            ModelVolume *v = text_at(t, "Text.width");
+            std::string text, font; float size, depth; bool bold, italic;
+            _orca_text_params(v, text, font, size, depth, bold, italic);
+            TextResult r;
+            load_text_shape(text.c_str(), font.c_str(), size, depth, bold, italic, r);
+            return r.text_width;
+        })
+        .def("set_text", [](const PyText &t, const std::string &new_text,
+                            bool fit, py::object max_width) -> py::object {
+            main_thread("Text.set_text");
+            ModelObject *obj = object_at(t.obj_idx, "Text.set_text");
+            ModelVolume *vol = text_at(t, "Text.set_text");
+            std::string text, font; float size, depth; bool bold, italic;
+            _orca_text_params(vol, text, font, size, depth, bold, italic);
+
+            double target_w;
+            if (!max_width.is_none()) {
+                target_w = max_width.cast<double>();
+            } else {
+                TextResult orig;
+                load_text_shape(text.c_str(), font.c_str(), size, depth, bold, italic, orig);
+                target_w = orig.text_width;
+            }
+            TextResult r;
+            load_text_shape(new_text.c_str(), font.c_str(), size, depth, bold, italic, r);
+            bool fitted = false;
+            if (fit && r.text_width > target_w && r.text_width > 0.0) {
+                size = (float)(size * (target_w / r.text_width));
+                load_text_shape(new_text.c_str(), font.c_str(), size, depth, bold, italic, r);
+                fitted = true;
+            }
+            if (r.text_mesh.empty())
+                throw std::runtime_error("Text.set_text: mesh generation failed (font missing?)");
+
+            TextConfiguration tc = *vol->text_configuration;   // copy + update
+            tc.text = new_text;
+            tc.style.prop.size_in_mm = size;
+
+            GUI::wxGetApp().plater()->take_snapshot("Edit Text");
+            Geometry::Transformation tran = vol->get_transformation();
+            ModelVolume *nv = obj->add_volume(r.text_mesh, false);
+            nv->calculate_convex_hull();
+            nv->set_transformation(tran.get_matrix());
+            nv->text_configuration = tc;
+            nv->name = vol->name;
+            nv->set_type(vol->type());
+            nv->config.apply(vol->config);
+            std::swap(obj->volumes[t.vol_idx], obj->volumes.back());
+            obj->delete_volume(obj->volumes.size() - 1);
+            obj->invalidate_bounding_box();
+            GUI::wxGetApp().plater()->changed_object(int(t.obj_idx));
+
+            py::dict d;
+            d["text"] = new_text; d["font_size"] = size; d["width"] = r.text_width;
+            d["fit_target"] = target_w; d["fitted"] = fitted;
+            return d;
+        }, py::arg("text"), py::arg("fit") = true, py::arg("max_width") = py::none());
 
     // ---- Object -----------------------------------------------------------
     py::class_<PyObject>(m, "Object")
@@ -326,6 +458,18 @@ void register_object_model(py::module_ &m)
             for (size_t i = 0; i < obj->volumes.size(); ++i)
                 out.append(PyVolume{o.idx, i});
             return out;
+        })
+        .def("texts", [](const PyObject &o) {
+            ModelObject *obj = object_at(o.idx, "Object.texts");
+            py::list out;
+            for (size_t i = 0; i < obj->volumes.size(); ++i)
+                if (obj->volumes[i]->is_text())
+                    out.append(PyText{o.idx, i});
+            return out;
+        })
+        .def_property_readonly("config", [](const PyObject &o) {
+            (void) object_at(o.idx, "Object.config");   // bounds-check
+            return PyConfig{ConfigSource::Object, int(o.idx)};
         })
         .def("bounding_box", [](const PyObject &o) {
             const BoundingBoxf3 &bb = object_at(o.idx, "Object.bounding_box")->bounding_box_approx();
@@ -350,6 +494,94 @@ void register_object_model(py::module_ &m)
             (void) object_at(o.idx, "Object.delete");     // bounds-check
             plater->delete_object_from_model(o.idx);      // snapshots internally
         })
+        // ---- transforms (UI-parity: the rotate / scale / mirror gizmos and
+        //      the "set number of instances" action) --------------------------
+        .def("rotate", [](const PyObject &o, double rx, double ry, double rz) {
+            auto *plater = plater_or_throw("Object.rotate");
+            ModelObject *obj = object_at(o.idx, "Object.rotate");
+            GUI::Plater::TakeSnapshot snap(plater, "API: rotate object");
+            if (rx != 0.0) obj->rotate(rx * M_PI / 180.0, X);
+            if (ry != 0.0) obj->rotate(ry * M_PI / 180.0, Y);
+            if (rz != 0.0) obj->rotate(rz * M_PI / 180.0, Z);
+            obj->invalidate_bounding_box();
+            plater->changed_object(int(o.idx));
+        }, py::arg("rx") = 0.0, py::arg("ry") = 0.0, py::arg("rz") = 0.0)
+        .def("scale", [](const PyObject &o, double x, py::object y, py::object z) {
+            const double sx = x;
+            const double sy = y.is_none() ? x : y.cast<double>();
+            const double sz = z.is_none() ? x : z.cast<double>();
+            if (sx <= 0.0 || sy <= 0.0 || sz <= 0.0)
+                throw std::runtime_error("scale factors must be > 0");
+            auto *plater = plater_or_throw("Object.scale");
+            ModelObject *obj = object_at(o.idx, "Object.scale");
+            GUI::Plater::TakeSnapshot snap(plater, "API: scale object");
+            obj->scale(Vec3d(sx, sy, sz));
+            obj->invalidate_bounding_box();
+            plater->changed_object(int(o.idx));
+        }, py::arg("x"), py::arg("y") = py::none(), py::arg("z") = py::none())
+        .def("mirror", [](const PyObject &o, const std::string &axis) {
+            Axis a;
+            if      (axis == "x" || axis == "X") a = X;
+            else if (axis == "y" || axis == "Y") a = Y;
+            else if (axis == "z" || axis == "Z") a = Z;
+            else throw std::runtime_error("axis must be 'x', 'y', or 'z'");
+            auto *plater = plater_or_throw("Object.mirror");
+            ModelObject *obj = object_at(o.idx, "Object.mirror");
+            GUI::Plater::TakeSnapshot snap(plater, "API: mirror object");
+            obj->mirror(a);
+            obj->invalidate_bounding_box();
+            plater->changed_object(int(o.idx));
+        }, py::arg("axis"))
+        .def("set_instances", [](const PyObject &o, int n) {
+            if (n < 1) throw std::runtime_error("instance count must be >= 1");
+            auto *plater = plater_or_throw("Object.set_instances");
+            ModelObject *obj = object_at(o.idx, "Object.set_instances");
+            GUI::Plater::TakeSnapshot snap(plater, "API: set instances");
+            while (int(obj->instances.size()) < n) {
+                ModelInstance *ni = obj->add_instance(*obj->instances.front());
+                ni->set_offset(ni->get_offset() + Vec3d(5.0, 5.0, 0.0));  // arrange() separates
+            }
+            while (int(obj->instances.size()) > n)
+                obj->delete_last_instance();
+            plater->changed_object(int(o.idx));
+        }, py::arg("n"))
+        .def("transform", [](const PyObject &o) {
+            ModelObject *obj = object_at(o.idx, "Object.transform");
+            const BoundingBoxf3 bb = obj->bounding_box_approx();
+            py::dict d;
+            d["size"]   = vec3(bb.size());
+            d["center"] = vec3(bb.center());
+            if (!obj->instances.empty())
+                d["position"] = vec3(obj->instances.front()->get_offset());
+            d["instances"] = obj->instances.size();
+            return d;
+        })
+        // ---- geometry finish (UI-parity: drop-to-bed, scale-to-fit, rename) --
+        .def("place_on_bed", [](const PyObject &o) {
+            auto *plater = plater_or_throw("Object.place_on_bed");
+            ModelObject *obj = object_at(o.idx, "Object.place_on_bed");
+            GUI::Plater::TakeSnapshot snap(plater, std::string("API: place on bed"));
+            obj->ensure_on_bed();
+            obj->invalidate_bounding_box();
+            plater->changed_object(int(o.idx));
+        })
+        .def("scale_to_fit", [](const PyObject &o, double x, double y, double z) {
+            if (x <= 0.0 || y <= 0.0 || z <= 0.0)
+                throw std::runtime_error("fit size must be > 0");
+            auto *plater = plater_or_throw("Object.scale_to_fit");
+            ModelObject *obj = object_at(o.idx, "Object.scale_to_fit");
+            GUI::Plater::TakeSnapshot snap(plater, std::string("API: scale to fit"));
+            obj->scale_to_fit(Vec3d(x, y, z));
+            obj->invalidate_bounding_box();
+            plater->changed_object(int(o.idx));
+        }, py::arg("x"), py::arg("y"), py::arg("z"))
+        .def("rename", [](const PyObject &o, const std::string &name) {
+            auto *plater = plater_or_throw("Object.rename");
+            ModelObject *obj = object_at(o.idx, "Object.rename");
+            GUI::Plater::TakeSnapshot snap(plater, std::string("API: rename object"));
+            obj->name = name;
+            plater->changed_object(int(o.idx));
+        }, py::arg("name"))
         // ---- paint-by-height: per-Z-band config overrides ------------------
         // UI-parity: mirrors the object-list "Height range Modifier". Writes
         // ModelObject::layer_config_ranges[{min_z,max_z}] and refreshes via
@@ -447,7 +679,12 @@ void register_object_model(py::module_ &m)
             auto *plater = plater_or_throw("Model.remove");
             (void) object_at(o.idx, "Model.remove");       // bounds-check
             plater->delete_object_from_model(o.idx);        // snapshots internally
-        }, py::arg("object"));
+        }, py::arg("object"))
+        // ---- clear the scene (UI-parity: Edit -> Delete All) ---------------
+        .def("clear", [](const PyModel &) {
+            auto *plater = plater_or_throw("Model.clear");
+            plater->delete_all_objects_from_model();   // one-shot; snapshots internally
+        });
 
     // ---- Plate / PlateList ------------------------------------------------
     py::class_<PyPlate>(m, "Plate")
@@ -489,7 +726,7 @@ void register_object_model(py::module_ &m)
             for (auto handle : changes) {
                 py::dict d = handle.cast<py::dict>();
                 CustomGCode::Item item;
-                item.type = CustomGCode::ColorChange;
+                item.type = CustomGCode::ToolChange;
                 if (!d.contains("z"))
                     throw std::runtime_error("each colour change needs a 'z' (print_z)");
                 item.print_z = d["z"].cast<double>();
@@ -685,6 +922,28 @@ void register_object_model(py::module_ &m)
             return PyConfig{ConfigSource::Printer};
         })
         // ---- M3 slicing ---------------------------------------------------
+        // Set up N project filaments with the given colours (UI-parity: the
+        // Sidebar "+" add-filament path). Colours are "#RRGGBB". Enables
+        // multi-colour prints; build_ams_mapping matches these to AMS slots.
+        .def("set_filaments", [](const PyDocument &, py::list colors) {
+            auto *plater = plater_or_throw("Document.set_filaments");
+            auto *pb = GUI::wxGetApp().preset_bundle;
+            const unsigned int n = (unsigned int) colors.size();
+            if (n < 1 || n > 16) throw std::runtime_error("filament count must be 1..16");
+            GUI::Plater::TakeSnapshot snap(plater, std::string("API: set filaments"));
+            pb->set_num_filaments(n);
+            std::vector<std::string> cols;
+            for (auto c : colors) {
+                std::string h = c.cast<std::string>();
+                if (!h.empty() && h[0] != '#') h = "#" + h;
+                cols.push_back(h);
+            }
+            if (auto *opt = pb->project_config.option<ConfigOptionStrings>("filament_colour"))
+                opt->values = cols;
+            plater->on_filament_count_change(n);
+            plater->on_config_change(pb->full_config());   // schedule reslice (not via Tab)
+            return int(n);
+        }, py::arg("colors"))
         .def("slice", [](const PyDocument &, py::object plate) {
             auto *plater = plater_or_throw("Document.slice");
             auto &list = plater->get_partplate_list();
@@ -699,13 +958,39 @@ void register_object_model(py::module_ &m)
             }
             plater->reslice();            // starts the background slicing worker
             return PySliceJob{idx};
-        }, py::arg("plate") = py::none());
+        }, py::arg("plate") = py::none())
+        // Copy the current plate's last sliced G-code to `path`.
+        .def("save_gcode", [](const PyDocument &, const std::string &path) {
+            namespace fs = boost::filesystem;
+            auto *plater = plater_or_throw("Document.save_gcode");
+            auto &list = plater->get_partplate_list();
+            GUI::PartPlate *plate = list.get_plate(list.get_curr_plate_index());
+            if (plate == nullptr) throw std::runtime_error("no current plate");
+            fs::path src(plate->get_tmp_gcode_path());
+            if (src.empty() || !fs::exists(src))
+                throw std::runtime_error("no sliced G-code yet; call slice().wait() first");
+            fs::copy_file(src, fs::path(path), fs::copy_option::overwrite_if_exists);
+            return path;
+        }, py::arg("path"))
+        // Save the project as a .3mf (UI-parity: Save Project).
+        .def("save_3mf", [](const PyDocument &, const std::string &path) {
+            namespace fs = boost::filesystem;
+            auto *plater = plater_or_throw("Document.save_3mf");
+            plater->export_3mf(fs::path(path));
+            if (!fs::exists(fs::path(path)) || fs::file_size(fs::path(path)) == 0)
+                throw std::runtime_error("3mf not written: " + path);
+            return path;
+        }, py::arg("path"));
 
     // ---- Application ------------------------------------------------------
     py::class_<PyApp>(m, "Application")
         .def_property_readonly("version", [](const PyApp &) {
             main_thread("app.version");
             return std::string(SLIC3R_VERSION);
+        })
+        .def_property_readonly("name", [](const PyApp &) {
+            main_thread("app.name");
+            return std::string(SLIC3R_APP_NAME);   // BambuStudio / OrcaSlicer / PrusaSlicer
         })
         .def_property_readonly("active_document", [](const PyApp &) -> py::object {
             main_thread("app.active_document");
@@ -734,6 +1019,76 @@ void register_object_model(py::module_ &m)
         });
 
     m.attr("app") = py::cast(PyApp{});
+
+    // MakerWorld model download — Python (urllib) transport to navigate
+    // Cloudflare (which fingerprints/blocks libcurl). Reuses the C++ auth
+    // primitive device.request_bind_ticket(). Exposed as pyslic3r.download_model.
+    {
+        py::dict ns;
+        py::exec(R"PYSRC(
+def download_model(url_or_id, instance_id=None, out_dir=None, retries=4):
+    """Download a MakerWorld model's 3mf via the logged-in Bambu account.
+    url_or_id: MakerWorld URL (…/models/<design>…#profileId-<instance>) or design id.
+    Returns {name, path, size, design_id, instance_id}. Navigates Cloudflare via
+    Python's TLS (native libcurl is blocked); retries transient 403/429/5xx."""
+    import pyslic3r as _ps, urllib.request, urllib.parse, http.cookiejar, json, os, re, tempfile, time
+    dev = _ps.app.device
+    if not dev.is_logged_in:
+        raise RuntimeError("download_model: not logged in to a Bambu account")
+    design_id, inst = None, instance_id
+    m = re.search(r"/models/(\d+)", str(url_or_id))
+    if m:
+        design_id = m.group(1)
+    m = re.search(r"profileId-(\d+)", str(url_or_id))
+    if m and inst is None:
+        inst = m.group(1)
+    if design_id is None:
+        design_id = str(url_or_id)
+    if inst is None:
+        raise RuntimeError("download_model: need instance_id= or a URL containing #profileId-<id>")
+    host = "https://makerworld.com/"
+    hdrs = {"User-Agent": "BambuStudio", "accept": "*/*"}
+    TRANSIENT = (403, 429, 500, 502, 503, 504)
+    err = None
+    for attempt in range(max(1, retries)):
+        try:
+            ticket = dev.request_bind_ticket()
+            if not ticket:
+                raise RuntimeError("request_bind_ticket failed (login/session?)")
+            f3mf = host + "api/v1/design-service/instance/%s/f3mf" % inst
+            signin = host + "api/sign-in/ticket?to=" + urllib.parse.quote(f3mf, safe="") + "&ticket=" + ticket
+            cj = http.cookiejar.CookieJar()
+            op = urllib.request.build_opener(urllib.request.HTTPCookieProcessor(cj))
+            meta = op.open(urllib.request.Request(signin, headers=hdrs), timeout=60).read()
+            j = json.loads(meta)
+            cdn = j.get("url")
+            name = j.get("name") or ("model_%s.3mf" % inst)
+            if not cdn:
+                raise RuntimeError("could not resolve file url: %r" % meta[:160])
+            data = op.open(urllib.request.Request(cdn, headers=hdrs), timeout=180).read()
+            if not data:
+                raise RuntimeError("downloaded file is empty")
+            d = out_dir or tempfile.gettempdir()
+            os.makedirs(d, exist_ok=True)
+            path = os.path.join(d, name)
+            with open(path, "wb") as f:
+                f.write(data)
+            return {"name": name, "path": path, "size": len(data),
+                    "design_id": design_id, "instance_id": inst}
+        except urllib.error.HTTPError as e:
+            err = e
+            if e.code in TRANSIENT and attempt < retries - 1:
+                time.sleep(1.5 * (2 ** attempt)); continue
+            raise RuntimeError("download_model: HTTP %s from MakerWorld (Cloudflare?)" % e.code)
+        except Exception as e:
+            err = e
+            if attempt < retries - 1:
+                time.sleep(1.5 * (2 ** attempt)); continue
+            raise
+    raise RuntimeError("download_model failed after %d attempts: %s" % (retries, err))
+)PYSRC", ns, ns);
+        m.attr("download_model") = ns["download_model"];
+    }
 }
 
 } // namespace pyslic3r
