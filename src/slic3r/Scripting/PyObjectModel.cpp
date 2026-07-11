@@ -31,6 +31,9 @@
 #include "libslic3r/QuadricEdgeCollapse.hpp"   // object.simplify
 #include "libslic3r/TriangleMesh.hpp"   // its_volume (object.measure)
 #include "libslic3r/MeshBoolean.hpp"     // object.boolean
+#include "libslic3r/NSVGUtils.hpp"      // object.emboss_svg (SVG -> shapes)
+#include "libslic3r/Emboss.hpp"         // object.emboss_svg (shapes -> mesh)
+#include "libslic3r/ClipperUtils.hpp"   // union_ex (object.emboss_svg)
 #include <limits>
 #include "libslic3r/Format/STL.hpp"   // store_stl (export_stl)
 #include "libslic3r/Shape/TextShape.hpp"   // load_text_shape / TextResult (editable text)
@@ -684,6 +687,30 @@ static TriangleMesh object_world_mesh(const ModelObject *obj)
         out.merge(m);
     }
     return out;
+}
+
+// Extrude an SVG file into a solid mesh (the SVG-emboss gizmo core: NSVG parse
+// -> union of 2D shapes -> Emboss::polygons2model with a depth projection).
+static TriangleMesh svg_to_mesh(const std::string &path, double depth_mm)
+{
+    if (depth_mm <= 0.0) throw std::runtime_error("emboss_svg: depth must be > 0");
+    NSVGimage_ptr img = nsvgParseFromFile(path, "mm", 96.0f);
+    if (!img) throw std::runtime_error("emboss_svg: could not parse SVG: " + path);
+    const double tol_mm = 0.1;   // curve tessellation tolerance (as the SVG gizmo uses)
+    NSVGLineParams params((tol_mm * tol_mm) / (SCALING_FACTOR * SCALING_FACTOR));
+    ExPolygonsWithIds ids = create_shape_with_ids(*img, params);
+    ExPolygons shapes;
+    for (const auto &sh : ids) if (!sh.expoly.empty()) expolygons_append(shapes, sh.expoly);
+    shapes = union_ex(shapes);
+    if (shapes.empty()) throw std::runtime_error("emboss_svg: no usable shapes in " + path);
+    const double scale = SCALING_FACTOR;              // EmbossShape default scale
+    const double depth = depth_mm / scale;            // SHAPE_SCALE applied in ProjectZ
+    auto projectZ = std::make_unique<Emboss::ProjectZ>(depth);
+    Transform3d tr = Eigen::Translation<double, 3>(0., 0., 0.) * Eigen::Scaling(scale);
+    Emboss::ProjectTransform project(std::move(projectZ), tr);
+    indexed_triangle_set its = Emboss::polygons2model(shapes, project);
+    if (its.indices.empty()) throw std::runtime_error("emboss_svg: produced an empty mesh");
+    return TriangleMesh(std::move(its));
 }
 
 } // anonymous namespace
@@ -1360,6 +1387,20 @@ void register_object_model(py::module_ &m)
                 if (v->is_model_part()) total += (int) v->mesh().its.indices.size();
             return total;
         }, py::arg("other"), py::arg("op"))
+        .def("emboss_svg", [](const PyObject &o, const std::string &path, double depth) {
+            main_thread("Object.emboss_svg");
+            auto *plater = plater_or_throw("Object.emboss_svg");
+            ModelObject *obj = object_at(o.idx, "Object.emboss_svg");
+            TriangleMesh mesh = svg_to_mesh(path, depth);   // may throw before we mutate
+            GUI::Plater::TakeSnapshot snap(plater, std::string("API: emboss SVG"));
+            ModelVolume *nv = obj->add_volume(std::move(mesh));   // MODEL_PART
+            nv->name = boost::filesystem::path(path).stem().string();
+            nv->calculate_convex_hull();
+            obj->invalidate_bounding_box();
+            obj->ensure_on_bed();
+            plater->changed_object(int(o.idx));
+            return PyVolume{ o.idx, obj->volumes.size() - 1 };
+        }, py::arg("path"), py::arg("depth") = 2.0)
         .def("measure", [](const PyObject &o) {
             ModelObject *obj = object_at(o.idx, "Object.measure");
             double vol = 0.0, area = 0.0; int tris = 0;
