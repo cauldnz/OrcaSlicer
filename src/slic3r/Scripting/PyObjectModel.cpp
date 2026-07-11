@@ -29,6 +29,7 @@
 #include "libslic3r/Model.hpp"
 #include "libslic3r/TriangleSelector.hpp"   // facet paint (MMU)
 #include "libslic3r/QuadricEdgeCollapse.hpp"   // object.simplify
+#include "libslic3r/TriangleMesh.hpp"   // its_volume (object.measure)
 #include <limits>
 #include "libslic3r/Format/STL.hpp"   // store_stl (export_stl)
 #include "libslic3r/Shape/TextShape.hpp"   // load_text_shape / TextResult (editable text)
@@ -1148,6 +1149,30 @@ void register_object_model(py::module_ &m)
             for (const ModelVolume *mv : obj->volumes)
                 if (mv->is_model_part()) total += (int) mv->mesh().its.indices.size();
             return total;
+        })
+        .def("measure", [](const PyObject &o) {
+            ModelObject *obj = object_at(o.idx, "Object.measure");
+            double vol = 0.0, area = 0.0; int tris = 0;
+            for (const ModelVolume *v : obj->volumes) {
+                if (!v->is_model_part()) continue;
+                TriangleMesh tm(v->mesh());
+                tm.transform(v->get_matrix(), true);
+                if (!obj->instances.empty()) tm.transform(obj->instances[0]->get_matrix(), true);
+                const indexed_triangle_set &its = tm.its;
+                vol += std::abs((double) its_volume(its));
+                tris += (int) its.indices.size();
+                for (const auto &t : its.indices) {
+                    const Vec3d a = its.vertices[t[0]].cast<double>();
+                    const Vec3d b = its.vertices[t[1]].cast<double>();
+                    const Vec3d c = its.vertices[t[2]].cast<double>();
+                    area += 0.5 * (b - a).cross(c - a).norm();
+                }
+            }
+            py::dict out;
+            out["volume_mm3"] = vol;
+            out["surface_area_mm2"] = area;
+            out["triangles"] = tris;
+            return out;
         })
         .def("convert_units", [](const PyObject &o, const std::string &conversion) {
             main_thread("Object.convert_units");
