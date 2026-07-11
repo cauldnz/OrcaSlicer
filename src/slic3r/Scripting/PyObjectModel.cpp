@@ -28,6 +28,7 @@
 #include "libslic3r/libslic3r.h"
 #include "libslic3r/Model.hpp"
 #include "libslic3r/TriangleSelector.hpp"   // facet paint (MMU)
+#include "libslic3r/QuadricEdgeCollapse.hpp"   // object.simplify
 #include <limits>
 #include "libslic3r/Format/STL.hpp"   // store_stl (export_stl)
 #include "libslic3r/Shape/TextShape.hpp"   // load_text_shape / TextResult (editable text)
@@ -1113,6 +1114,41 @@ void register_object_model(py::module_ &m)
             plater->changed_object(int(o.idx));
             return int(obj->volumes.size() - 1);   // index of the new volume
         }, py::arg("path"), py::arg("type") = "part")
+        .def("simplify", [](const PyObject &o, double ratio) {
+            main_thread("Object.simplify");
+            if (ratio <= 0.0 || ratio >= 1.0)
+                throw std::runtime_error("simplify: ratio must be in (0, 1) — the fraction of triangles to keep");
+            auto *plater = plater_or_throw("Object.simplify");
+            ModelObject *obj = object_at(o.idx, "Object.simplify");
+            GUI::Plater::TakeSnapshot snap(plater, std::string("API: simplify"));
+            plater->clear_before_change_mesh(int(o.idx));
+            int total = 0;
+            for (ModelVolume *mv : obj->volumes) {
+                if (!mv->is_model_part()) continue;
+                indexed_triangle_set its = mv->mesh().its;   // editable copy
+                const uint32_t cur = (uint32_t) its.indices.size();
+                uint32_t target = (uint32_t) std::max<double>(4.0, double(cur) * ratio);
+                if (target < cur) {
+                    its_quadric_edge_collapse(its, target, nullptr, nullptr, nullptr);
+                    TriangleMesh tm(its);
+                    mv->set_mesh(std::move(tm));
+                    mv->calculate_convex_hull();
+                    mv->set_new_unique_id();
+                }
+                total += (int) mv->mesh().its.indices.size();
+            }
+            obj->invalidate_bounding_box();
+            obj->ensure_on_bed();
+            plater->changed_mesh(int(o.idx));
+            return total;
+        }, py::arg("ratio") = 0.5)
+        .def_property_readonly("triangle_count", [](const PyObject &o) {
+            ModelObject *obj = object_at(o.idx, "Object.triangle_count");
+            int total = 0;
+            for (const ModelVolume *mv : obj->volumes)
+                if (mv->is_model_part()) total += (int) mv->mesh().its.indices.size();
+            return total;
+        })
         .def("convert_units", [](const PyObject &o, const std::string &conversion) {
             main_thread("Object.convert_units");
             double f;
