@@ -1928,6 +1928,20 @@ void register_object_model(py::module_ &m)
             plater->on_config_change(pb->full_config());   // schedule reslice (not via Tab)
             return int(n);
         }, py::arg("colors"))
+        .def("validate", [](const PyDocument &) {
+            main_thread("Document.validate");
+            auto *plater = plater_or_throw("Document.validate");
+            // Apply the current model + edited config to the Print synchronously (the
+            // same apply the background slicer does), then read validate() — no slice.
+            Print &print = plater->fff_print();
+            const DynamicPrintConfig cfg = GUI::wxGetApp().preset_bundle->full_config();
+            print.apply(plater->model(), cfg);
+            std::string err = plater->fff_print().validate().string;
+            py::dict d;
+            d["ok"]    = err.empty();
+            d["error"] = err;
+            return d;
+        })
         .def("slice", [](const PyDocument &, py::object plate) {
             auto *plater = plater_or_throw("Document.slice");
             auto &list = plater->get_partplate_list();
