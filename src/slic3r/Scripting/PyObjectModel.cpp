@@ -1193,6 +1193,9 @@ void register_object_model(py::module_ &m)
         .def_property_readonly("printer_config", [](const PyDocument &) {
             return PyConfig{ConfigSource::Printer};
         })
+        .def_property_readonly("filament_count", [](const PyDocument &) {
+            return (int) GUI::wxGetApp().preset_bundle->filament_presets.size();
+        })
         // ---- M3 slicing ---------------------------------------------------
         // Set up N project filaments with the given colours (UI-parity: the
         // Sidebar "+" add-filament path). Colours are "#RRGGBB". Enables
