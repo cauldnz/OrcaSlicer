@@ -936,6 +936,23 @@ void register_object_model(py::module_ &m)
             return PyPlate{i};
         })
         // ---- M2 mutation --------------------------------------------------
+        .def("orient", [](const PyPlateList &, bool wait) {
+            // Auto-orient objects (toolbar Orient). Async OrientJob; same
+            // event-pump wait as arrange. Bambu/Orca only (Prusa has no orient).
+            auto *plater = plater_or_throw("PlateList.orient");
+            plater->orient();
+            if (!wait) return;
+            main_thread("PlateList.orient(wait=True)");
+            py::gil_scoped_release nogil;
+            using clock = std::chrono::steady_clock;
+            const auto t0 = clock::now();
+            for (;;) {
+                if (wxTheApp != nullptr) wxTheApp->Yield(true);
+                if (plater->get_ui_job_worker().is_idle()) break;
+                if (clock::now() - t0 > std::chrono::seconds(120)) break;
+                wxMilliSleep(40);
+            }
+        }, py::arg("wait") = false)
         .def("arrange", [](const PyPlateList &, bool wait) {
             // Auto-arrange, same as the toolbar button. Asynchronous — starts a
             // background ArrangeJob (which snapshots itself). With wait=True,
