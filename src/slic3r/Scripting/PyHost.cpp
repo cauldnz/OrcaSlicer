@@ -12,6 +12,9 @@
 
 #include <pybind11/embed.h>
 #include <thread>
+#include <mutex>
+#include <condition_variable>
+#include <deque>
 #ifndef _WIN32
 #include <sys/socket.h>
 #include <netinet/in.h>
@@ -77,12 +80,16 @@ void ensure_main_thread(const char *what)
 // dropped by the linker.
 // ---------------------------------------------------------------------------
 
+static void bridge_emit(const std::string &line);
+
 PYBIND11_EMBEDDED_MODULE(pyslic3r, m)
 {
     m.doc() = "pyslic3r — embedded object model + cloud device plane over the running app";
     register_object_model(m);
 #ifndef PYSLIC3R_NO_DEVICE
     register_device(m);
+    m.def("_emit_raw", [](const std::string &s) { bridge_emit(s); },
+          "enqueue a JSON-RPC notification line to the active bridge connection");
 #endif
 }
 
@@ -187,6 +194,49 @@ _ps._handle_request = _handle_request
 )PY";
 
 #ifndef _WIN32
+// Outbound channel: all writes (responses + async notifications) serialize through
+// one writer thread draining a queue, so the app can PUSH notifications to the
+// connected client (bridge_emit), not just answer requests. Single connection.
+static std::mutex               g_out_mtx;
+static std::condition_variable  g_out_cv;
+static std::deque<std::string>  g_outbox;
+static int                      g_conn_fd = -1;
+static bool                     g_conn_open = false;
+
+static void outbox_push(std::string line)
+{
+    { std::lock_guard<std::mutex> lk(g_out_mtx); g_outbox.push_back(std::move(line)); }
+    g_out_cv.notify_one();
+}
+
+static void bridge_emit(const std::string &line)   // Python/main-thread callable
+{
+    if (g_conn_open) outbox_push(line);
+}
+
+static void bridge_writer_loop()
+{
+    for (;;) {
+        std::string line;
+        {
+            std::unique_lock<std::mutex> lk(g_out_mtx);
+            g_out_cv.wait(lk, [] { return !g_outbox.empty() || !g_conn_open; });
+            if (g_outbox.empty() && !g_conn_open) return;
+            line = std::move(g_outbox.front());
+            g_outbox.pop_front();
+        }
+        line.push_back('\n');
+        if (g_conn_fd >= 0) {
+            ssize_t off = 0, len = (ssize_t) line.size();
+            while (off < len) {
+                ssize_t w = ::send(g_conn_fd, line.data() + off, (size_t)(len - off), MSG_NOSIGNAL);
+                if (w <= 0) break;
+                off += w;
+            }
+        }
+    }
+}
+
 static void bridge_serve(int port)
 {
     int srv = ::socket(AF_INET, SOCK_STREAM, 0);
@@ -200,6 +250,9 @@ static void bridge_serve(int port)
     for (;;) {
         int c = ::accept(srv, nullptr, nullptr);
         if (c < 0) continue;
+        { std::lock_guard<std::mutex> lk(g_out_mtx); g_outbox.clear(); }
+        g_conn_fd = c; g_conn_open = true;
+        std::thread writer(bridge_writer_loop);
         std::string buf; char tmp[8192];
         for (;;) {
             ssize_t n = ::recv(c, tmp, sizeof(tmp), 0);
@@ -220,13 +273,18 @@ static void bridge_serve(int port)
                     resp = std::string("{\"jsonrpc\":\"2.0\",\"id\":null,\"error\":{\"code\":-32001,\"message\":\"bridge: ")
                          + e.what() + "\"}}";
                 }
-                resp.push_back('\n');
-                ::send(c, resp.data(), resp.size(), 0);
+                outbox_push(std::move(resp));   // response rides the writer thread too
             }
         }
+        g_conn_open = false;
+        g_out_cv.notify_all();
+        writer.join();
+        g_conn_fd = -1;
         ::close(c);
     }
 }
+#else
+static void bridge_emit(const std::string &) {}   // Winsock port deferred
 #endif
 
 void maybe_start_bridge()
