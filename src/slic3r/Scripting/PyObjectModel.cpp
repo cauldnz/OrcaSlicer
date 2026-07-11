@@ -48,6 +48,7 @@
 #include "slic3r/GUI/Plater.hpp"
 #include "libslic3r/CutUtils.hpp"   // Cut class + ModelObjectCutAttribute (reworked cut)
 #include "slic3r/GUI/GLCanvas3D.hpp"   // canvas3D()->get_selection()
+#include "slic3r/GUI/GUI_ObjectList.hpp"   // object.duplicate registration
 #include "slic3r/GUI/Selection.hpp"     // Selection::add_object (headless select)
 #include "slic3r/GUI/PartPlate.hpp"
 #include "slic3r/GUI/Tab.hpp"
@@ -1112,6 +1113,26 @@ void register_object_model(py::module_ &m)
             obj->invalidate_bounding_box();
             plater->changed_object(int(o.idx));           // same refresh the GUI uses
         }, py::arg("dx"), py::arg("dy"), py::arg("dz"))
+        .def("duplicate", [](const PyObject &o) {
+            main_thread("Object.duplicate");
+            auto *plater = plater_or_throw("Object.duplicate");
+            Model &model = model_or_throw("Object.duplicate");
+            ModelObject *src = object_at(o.idx, "Object.duplicate");
+            GUI::Plater::TakeSnapshot snap(plater, std::string("API: duplicate object"));
+            // Deep copy: geometry, volumes, per-object/volume config, all paint, instances.
+            ModelObject *dup = model.add_object(*src);
+            const size_t new_idx = model.objects.size() - 1;
+            // Nudge the copy +X so it does not overlap the source.
+            const double gap = src->bounding_box_approx().size().x() + 5.0;
+            for (ModelInstance *inst : dup->instances)
+                inst->set_offset(inst->get_offset() + Vec3d(gap, 0.0, 0.0));
+            dup->invalidate_bounding_box();
+            // Register like the GUI does (also assigns a plate on Bambu/Orca).
+            GUI::wxGetApp().obj_list()->add_object_to_list(new_idx);
+            plater->get_view3D_canvas3D()->update_instance_printable_state_for_object(new_idx);
+            plater->changed_object(int(new_idx));
+            return PyObject{ new_idx };
+        })
         .def("delete", [](const PyObject &o) {
             auto *plater = plater_or_throw("Object.delete");
             (void) object_at(o.idx, "Object.delete");     // bounds-check
