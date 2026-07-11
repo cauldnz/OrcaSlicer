@@ -857,6 +857,76 @@ void register_object_model(py::module_ &m)
             plater->changed_object(int(v.obj_idx));
             return std::string(volume_type_str(vol->type()));
         }, py::arg("type"))
+        // ---- part transforms (UI-parity: reposition a part/modifier/negative volume
+        //      within its object, the way dragging it in the GUI does) --------------
+        .def("translate", [](const PyVolume &v, double dx, double dy, double dz) {
+            main_thread("Volume.translate");
+            auto *plater = plater_or_throw("Volume.translate");
+            ModelVolume *vol = volume_at(v, "Volume.translate");
+            ModelObject *obj = object_at(v.obj_idx, "Volume.translate");
+            GUI::Plater::TakeSnapshot snap(plater, std::string("API: move part"));
+            vol->translate(Vec3d(dx, dy, dz));
+            obj->invalidate_bounding_box();
+            plater->changed_object(int(v.obj_idx));
+        }, py::arg("dx"), py::arg("dy"), py::arg("dz"))
+        .def("rotate", [](const PyVolume &v, double rx, double ry, double rz) {
+            main_thread("Volume.rotate");
+            auto *plater = plater_or_throw("Volume.rotate");
+            ModelVolume *vol = volume_at(v, "Volume.rotate");
+            ModelObject *obj = object_at(v.obj_idx, "Volume.rotate");
+            GUI::Plater::TakeSnapshot snap(plater, std::string("API: rotate part"));
+            if (rx != 0.0) vol->rotate(rx * M_PI / 180.0, X);
+            if (ry != 0.0) vol->rotate(ry * M_PI / 180.0, Y);
+            if (rz != 0.0) vol->rotate(rz * M_PI / 180.0, Z);
+            obj->invalidate_bounding_box();
+            plater->changed_object(int(v.obj_idx));
+        }, py::arg("rx") = 0.0, py::arg("ry") = 0.0, py::arg("rz") = 0.0)
+        .def("scale", [](const PyVolume &v, double x, py::object y, py::object z) {
+            const double sx = x;
+            const double sy = y.is_none() ? x : y.cast<double>();
+            const double sz = z.is_none() ? x : z.cast<double>();
+            if (sx <= 0.0 || sy <= 0.0 || sz <= 0.0)
+                throw std::runtime_error("scale factors must be > 0");
+            main_thread("Volume.scale");
+            auto *plater = plater_or_throw("Volume.scale");
+            ModelVolume *vol = volume_at(v, "Volume.scale");
+            ModelObject *obj = object_at(v.obj_idx, "Volume.scale");
+            GUI::Plater::TakeSnapshot snap(plater, std::string("API: scale part"));
+            vol->scale(Vec3d(sx, sy, sz));
+            obj->invalidate_bounding_box();
+            plater->changed_object(int(v.obj_idx));
+        }, py::arg("x"), py::arg("y") = py::none(), py::arg("z") = py::none())
+        .def("mirror", [](const PyVolume &v, const std::string &axis) {
+            main_thread("Volume.mirror");
+            Axis a;
+            if      (axis == "x" || axis == "X") a = X;
+            else if (axis == "y" || axis == "Y") a = Y;
+            else if (axis == "z" || axis == "Z") a = Z;
+            else throw std::runtime_error("mirror: axis must be x, y or z");
+            auto *plater = plater_or_throw("Volume.mirror");
+            ModelVolume *vol = volume_at(v, "Volume.mirror");
+            ModelObject *obj = object_at(v.obj_idx, "Volume.mirror");
+            GUI::Plater::TakeSnapshot snap(plater, std::string("API: mirror part"));
+            vol->mirror(a);
+            obj->invalidate_bounding_box();
+            plater->changed_object(int(v.obj_idx));
+        }, py::arg("axis"))
+        .def("offset", [](const PyVolume &v) {
+            return vec3(volume_at(v, "Volume.offset")->get_transformation().get_offset());
+        })
+        .def("bounding_box", [](const PyVolume &v) {
+            const ModelVolume *vol = volume_at(v, "Volume.bounding_box");
+            const Transform3d m = vol->get_matrix();
+            BoundingBoxf3 bb;
+            for (const auto &p : vol->mesh().its.vertices)
+                bb.merge(Vec3d(m * p.cast<double>()));
+            py::dict d;
+            d["min"]    = vec3(bb.min);
+            d["max"]    = vec3(bb.max);
+            d["size"]   = vec3(bb.size());
+            d["center"] = vec3(bb.center());
+            return d;
+        })
         .def_property_readonly("is_mm_painted", [](const PyVolume &v) {
             return volume_at(v, "Volume.is_mm_painted")->is_mm_painted();
         })
