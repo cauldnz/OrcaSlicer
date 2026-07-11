@@ -27,6 +27,8 @@
 
 #include "libslic3r/libslic3r.h"
 #include "libslic3r/Model.hpp"
+#include "libslic3r/TriangleSelector.hpp"   // facet paint (MMU)
+#include <limits>
 #include "libslic3r/Format/STL.hpp"   // store_stl (export_stl)
 #include "libslic3r/Shape/TextShape.hpp"   // load_text_shape / TextResult (editable text)
 #include "libslic3r/BoundingBox.hpp"
@@ -224,6 +226,38 @@ ModelVolume *volume_at(const PyVolume &v, const char *what)
         throw std::runtime_error("volume index out of range (model changed?)");
     return obj->volumes[v.vol_idx];
 }
+
+// MMU facet paint helper: paint original facets whose world-Z centroid is in
+// (z_lo, z_hi] with the given 1-based extruder. Composes with existing paint.
+static int mmu_paint_band(const PyVolume &v, double z_lo, double z_hi, int extruder)
+{
+    if (extruder < 1 || extruder > 16)
+        throw std::runtime_error("extruder must be in 1..16");
+    ModelObject *obj = object_at(v.obj_idx, "Volume.paint_mmu");
+    ModelVolume *vol = volume_at(v, "Volume.paint_mmu");
+    const TriangleMesh &mesh = vol->mesh();
+    const indexed_triangle_set &its = mesh.its;
+    if (its.indices.empty())
+        throw std::runtime_error("paint_mmu: volume has no mesh");
+    Transform3d tr = vol->get_matrix();
+    if (!obj->instances.empty())
+        tr = obj->instances[0]->get_matrix() * tr;
+    TriangleSelector selector(mesh);
+    if (!vol->mmu_segmentation_facets.get_data().triangles_to_split.empty())
+        selector.deserialize(vol->mmu_segmentation_facets.get_data(), false);
+    const EnforcerBlockerType state = static_cast<EnforcerBlockerType>(extruder);
+    int painted = 0;
+    for (size_t i = 0; i < its.indices.size(); ++i) {
+        const auto &t = its.indices[i];
+        const Vec3d c = (its.vertices[t[0]].cast<double>() + its.vertices[t[1]].cast<double>() +
+                         its.vertices[t[2]].cast<double>()) / 3.0;
+        const double wz = (tr * c).z();
+        if (wz > z_lo && wz <= z_hi) { selector.set_facet(int(i), state); ++painted; }
+    }
+    vol->mmu_segmentation_facets.set(selector);
+    return painted;
+}
+
 
 // Resolve a text handle -> ModelVolume, asserting it is editable text.
 ModelVolume *text_at(const PyText &t, const char *what)
@@ -477,6 +511,19 @@ void register_object_model(py::module_ &m)
         })
         .def_property_readonly("is_seam_painted", [](const PyVolume &v) {
             return volume_at(v, "Volume.is_seam_painted")->is_seam_painted();
+        })
+        .def("paint_mmu_above", [](const PyVolume &v, double z, int extruder) {
+            main_thread("Volume.paint_mmu_above");
+            return mmu_paint_band(v, z, std::numeric_limits<double>::max(), extruder);
+        }, py::arg("z"), py::arg("extruder"))
+        .def("paint_mmu_band", [](const PyVolume &v, double z_min, double z_max, int extruder) {
+            main_thread("Volume.paint_mmu_band");
+            if (z_max <= z_min) throw std::runtime_error("paint_mmu_band: z_max must be > z_min");
+            return mmu_paint_band(v, z_min, z_max, extruder);
+        }, py::arg("z_min"), py::arg("z_max"), py::arg("extruder"))
+        .def("clear_mmu_paint", [](const PyVolume &v) {
+            main_thread("Volume.clear_mmu_paint");
+            volume_at(v, "Volume.clear_mmu_paint")->mmu_segmentation_facets.reset();
         })
         .def_property_readonly("config", [](const PyVolume &v) {
             (void) volume_at(v, "Volume.config");   // bounds-check
