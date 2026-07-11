@@ -38,6 +38,7 @@
 #include "libslic3r/Preset.hpp"
 #include "libslic3r/PresetBundle.hpp"
 #include "libslic3r/Print.hpp"                 // Print, PrintStatistics
+#include "libslic3r/Slicing.hpp"               // variable layer height
 #include "libslic3r/GCode/GCodeProcessor.hpp"  // GCodeProcessorResult
 #include "libslic3r/Format/bbs_3mf.hpp"        // LoadStrategy
 #include "libslic3r/CustomGCode.hpp"      // colour-change-by-height
@@ -650,6 +651,23 @@ static std::string build_state_script()
     return out;
 }
 
+// World-space Z height of an object (fork-agnostic; avoids bounding_box vs
+// bounding_box_approx drift) for slicing-parameter derivation.
+static double object_max_z(const ModelObject *obj)
+{
+    double zmax = 0.0;
+    for (const ModelVolume *v : obj->volumes) {
+        if (!v->is_model_part()) continue;
+        Transform3d tr = v->get_matrix();
+        if (!obj->instances.empty()) tr = obj->instances[0]->get_matrix() * tr;
+        for (const auto &vert : v->mesh().its.vertices) {
+            const double z = (tr * vert.cast<double>()).z();
+            if (z > zmax) zmax = z;
+        }
+    }
+    return zmax;
+}
+
 } // anonymous namespace
 
 // ---------------------------------------------------------------------------
@@ -1150,6 +1168,47 @@ void register_object_model(py::module_ &m)
                 if (mv->is_model_part()) total += (int) mv->mesh().its.indices.size();
             return total;
         })
+        .def("set_layer_height_profile", [](const PyObject &o, py::list pairs) {
+            main_thread("Object.set_layer_height_profile");
+            auto *plater = plater_or_throw("Object.set_layer_height_profile");
+            ModelObject *obj = object_at(o.idx, "Object.set_layer_height_profile");
+            std::vector<coordf_t> flat;
+            for (auto item : pairs) {
+                py::sequence pr = item.cast<py::sequence>();
+                flat.push_back(pr[0].cast<double>());   // z
+                flat.push_back(pr[1].cast<double>());   // layer height
+            }
+            obj->layer_height_profile.set(std::move(flat));
+            plater->changed_object(int(o.idx));
+            return (int)(obj->layer_height_profile.get().size() / 2);
+        }, py::arg("pairs"))
+        .def("layer_height_profile", [](const PyObject &o) {
+            ModelObject *obj = object_at(o.idx, "Object.layer_height_profile");
+            std::vector<coordf_t> flat = obj->layer_height_profile.get();
+            py::list out;
+            for (size_t i = 0; i + 1 < flat.size(); i += 2) out.append(py::make_tuple(flat[i], flat[i + 1]));
+            return out;
+        })
+        .def("clear_layer_height_profile", [](const PyObject &o) {
+            main_thread("Object.clear_layer_height_profile");
+            auto *plater = plater_or_throw("Object.clear_layer_height_profile");
+            object_at(o.idx, "Object.clear_layer_height_profile")->layer_height_profile.clear();
+            plater->changed_object(int(o.idx));
+        })
+        .def("adaptive_layer_height", [](const PyObject &o, double quality) {
+            main_thread("Object.adaptive_layer_height");
+            if (quality < 0.0 || quality > 1.0) throw std::runtime_error("quality must be in [0, 1]");
+            auto *plater = plater_or_throw("Object.adaptive_layer_height");
+            ModelObject *obj = object_at(o.idx, "Object.adaptive_layer_height");
+            const DynamicPrintConfig cfg = GUI::wxGetApp().preset_bundle->full_config();
+            const double maxz = object_max_z(obj);
+            SlicingParameters params = PrintObject::slicing_parameters(cfg, *obj, (float) maxz, Vec3d(1., 1., 1.));
+            std::vector<double> prof = layer_height_profile_adaptive(params, *obj, (float) quality);
+            PrintObject::update_layer_height_profile(*obj, params, prof);
+            obj->layer_height_profile.set(std::move(prof));
+            plater->changed_object(int(o.idx));
+            return (int)(obj->layer_height_profile.get().size() / 2);
+        }, py::arg("quality") = 0.5)
         .def("measure", [](const PyObject &o) {
             ModelObject *obj = object_at(o.idx, "Object.measure");
             double vol = 0.0, area = 0.0; int tris = 0;
