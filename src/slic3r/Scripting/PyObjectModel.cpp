@@ -126,6 +126,7 @@ struct PyDocument {};
 struct PyModel {};
 struct PyObject   { size_t idx; };
 struct PyVolume   { size_t obj_idx; size_t vol_idx; };
+struct PySettings {};
 struct PyText     { size_t obj_idx; size_t vol_idx; };
 struct PyPlateList {};
 struct PyPlate    { int idx; };
@@ -376,6 +377,130 @@ static void _select_only(size_t obj_idx, const char *what)
     GUI::Selection &sel = plater_or_throw(what)->canvas3D()->get_selection();
     sel.clear();
     sel.add_object((unsigned int) obj_idx, true);
+}
+
+
+// ---- curated settings registry ----------------------------------------------
+struct SettingDef {
+    std::string name;
+    std::string key;
+    char        kind;        // f i b p e o
+    bool        is_vector;
+    std::vector<std::pair<std::string,std::string>> emap;  // canonical -> fork string
+};
+static const std::vector<SettingDef> &settings_defs()
+{
+    static const std::vector<SettingDef> defs = {
+        {"layer_height","layer_height",'f',false,{}},
+        {"first_layer_height","initial_layer_print_height",'o',false,{}},
+        {"wall_count","wall_loops",'i',false,{}},
+        {"infill_density","sparse_infill_density",'p',false,{}},
+        {"infill_pattern","sparse_infill_pattern",'e',false,{{"grid","grid"},{"gyroid","gyroid"},{"honeycomb","honeycomb"},{"cubic","cubic"},{"concentric","concentric"},{"triangles","triangles"},{"lightning","lightning"}}},
+        {"top_layers","top_shell_layers",'i',false,{}},
+        {"bottom_layers","bottom_shell_layers",'i',false,{}},
+        {"top_pattern","top_surface_pattern",'e',false,{{"monotonic","monotonic"},{"concentric","concentric"},{"aligned","alignedrectilinear"}}},
+        {"seam_position","seam_position",'e',false,{{"nearest","nearest"},{"aligned","aligned"},{"rear","back"},{"random","random"}}},
+        {"supports_enable","enable_support",'b',false,{}},
+        {"supports_threshold","support_threshold_angle",'i',false,{}},
+        {"supports_on_plate_only","support_on_build_plate_only",'b',false,{}},
+        {"supports_style","support_style",'e',false,{{"grid","grid"},{"snug","snug"},{"organic","tree_organic"}}},
+        {"brim_type","brim_type",'e',false,{{"none","no_brim"},{"outer","outer_only"},{"inner","inner_only"},{"both","outer_and_inner"}}},
+        {"brim_width","brim_width",'f',false,{}},
+        {"skirt_loops","skirt_loops",'i',false,{}},
+        {"raft_layers","raft_layers",'i',false,{}},
+        {"fuzzy_skin","fuzzy_skin",'e',false,{{"none","none"},{"external","external"},{"all","all"}}},
+        {"spiral_vase","spiral_mode",'b',false,{}},
+        {"wall_generator","wall_generator",'e',false,{{"classic","classic"},{"arachne","arachne"}}},
+        {"elephant_foot","elefant_foot_compensation",'f',false,{}},
+        {"inner_wall_speed","inner_wall_speed",'f',true,{}},
+        {"outer_wall_speed","outer_wall_speed",'f',true,{}},
+        {"infill_speed","sparse_infill_speed",'f',true,{}},
+        {"travel_speed","travel_speed",'f',true,{}},
+        {"first_layer_speed","initial_layer_speed",'f',true,{}},
+        {"nozzle_temp","nozzle_temperature",'i',true,{}},
+        {"first_layer_nozzle_temp","nozzle_temperature_initial_layer",'i',true,{}},
+        {"bed_temp","hot_plate_temp",'i',true,{}},
+        {"fan_max","fan_max_speed",'i',true,{}},
+        {"retract_length","retraction_length",'f',true,{}},
+        {"retract_speed","retraction_speed",'f',true,{}},
+        {"z_hop","z_hop",'f',true,{}},
+        {"wipe_tower","enable_prime_tower",'b',false,{}},
+    };
+    return defs;
+}
+static const SettingDef *find_setting(const std::string &name)
+{
+    for (const auto &d : settings_defs()) if (d.name == name) return &d;
+    return nullptr;
+}
+// Auto-resolve which edited preset config carries the key (print/filament/printer).
+static DynamicPrintConfig *setting_cfg(const std::string &key, PresetCollection **out_col)
+{
+    PresetBundle *pb = GUI::wxGetApp().preset_bundle;
+    PresetCollection *cols[] = { &pb->prints, &pb->filaments, &pb->printers };
+    for (auto *col : cols) {
+        DynamicPrintConfig &cfg = col->get_edited_preset().config;
+        if (cfg.has(key)) { if (out_col) *out_col = col; return &cfg; }
+    }
+    return nullptr;
+}
+static void settings_set(const std::string &name, py::object val)
+{
+    const SettingDef *d = find_setting(name);
+    if (!d) throw std::runtime_error("unknown setting: " + name);
+    main_thread("Settings.set");
+    std::string sval;
+    if (d->kind == 'b') {
+        sval = val.cast<bool>() ? "1" : "0";
+    } else if (d->kind == 'e') {
+        const std::string canon = py::str(val).cast<std::string>();
+        bool ok = false;
+        for (const auto &p : d->emap) if (p.first == canon) { sval = p.second; ok = true; break; }
+        if (!ok) throw std::runtime_error("invalid option '" + canon + "' for setting '" + name + "'");
+    } else if (d->kind == 'i') {
+        sval = std::to_string((long long) std::llround(val.cast<double>()));
+    } else if (d->kind == 'p') {
+        // percent: force an explicit '%' so both forks parse it the same way
+        // (Prusa's bare-number coPercent deserialize scales x100).
+        std::string s = py::isinstance<py::str>(val) ? val.cast<std::string>()
+                                                     : py::str(val).cast<std::string>();
+        if (s.empty() || s.back() != '%') s += "%";
+        sval = s;
+    } else {
+        sval = py::isinstance<py::str>(val) ? val.cast<std::string>()
+                                            : py::str(val).cast<std::string>();
+    }
+    auto *plater = plater_or_throw("Settings.set");
+    PresetCollection *col = nullptr;
+    DynamicPrintConfig *cfg = setting_cfg(d->key, &col);
+    if (!cfg) throw std::runtime_error("no preset config carries key: " + d->key);
+    if (d->is_vector) {   // replicate a scalar across the current element count
+        const std::string cur = cfg->opt_serialize(d->key);
+        int n = cur.empty() ? 1 : (int) std::count(cur.begin(), cur.end(), ',') + 1;
+        std::string rep;
+        for (int i = 0; i < n; ++i) { if (i) rep += ","; rep += sval; }
+        sval = rep;
+    }
+    cfg->set_deserialize_strict(d->key, sval);
+    col->update_dirty();
+    plater->on_config_change(*cfg);
+}
+static py::object settings_get(const std::string &name)
+{
+    const SettingDef *d = find_setting(name);
+    if (!d) throw std::runtime_error("unknown setting: " + name);
+    DynamicPrintConfig *cfg = setting_cfg(d->key, nullptr);
+    if (!cfg || !cfg->has(d->key)) return py::none();
+    std::string raw = cfg->opt_serialize(d->key);
+    if (d->is_vector) { auto pos = raw.find(','); if (pos != std::string::npos) raw = raw.substr(0, pos); }
+    try {
+        if (d->kind == 'b') return py::bool_(raw == "1" || raw == "true");
+        if (d->kind == 'e') { for (const auto &p : d->emap) if (p.second == raw) return py::str(p.first); return py::str(raw); }
+        if (d->kind == 'i') return py::int_((long long) std::llround(std::stod(raw)));
+        if (d->kind == 'f') return py::float_(std::stod(raw));
+        if (d->kind == 'p') { std::string r = raw; if (!r.empty() && r.back() == '%') r.pop_back(); return py::float_(std::stod(r)); }
+    } catch (...) { /* fall through to string */ }
+    return py::str(raw);   // 'o' (float-or-percent) and any unparsable value
 }
 
 } // anonymous namespace
@@ -1240,6 +1365,44 @@ void register_object_model(py::module_ &m)
         }, py::arg("timeout") = py::none());
 
     // ---- Document ---------------------------------------------------------
+    // ---- Settings (curated/normalized) ------------------------------------
+    py::class_<PySettings>(m, "Settings")
+        .def("names", [](const PySettings &) {
+            py::list out;
+            for (const auto &d : settings_defs()) out.append(d.name);
+            return out;
+        })
+        .def("set", [](const PySettings &, const std::string &name, py::object value) {
+            settings_set(name, value);
+        }, py::arg("name"), py::arg("value"))
+        .def("get", [](const PySettings &, const std::string &name) {
+            return settings_get(name);
+        }, py::arg("name"))
+        .def("options", [](const PySettings &, const std::string &name) -> py::object {
+            const SettingDef *d = find_setting(name);
+            if (!d) throw std::runtime_error("unknown setting: " + name);
+            if (d->emap.empty()) return py::none();
+            py::list out;
+            for (const auto &p : d->emap) out.append(p.first);
+            return out;
+        }, py::arg("name"))
+        .def("describe", [](const PySettings &, const std::string &name) {
+            const SettingDef *d = find_setting(name);
+            if (!d) throw std::runtime_error("unknown setting: " + name);
+            py::dict out;
+            out["name"] = d->name;
+            out["key"] = d->key;
+            const char k[2] = { d->kind, 0 };
+            out["kind"] = std::string(k);
+            out["is_vector"] = d->is_vector;
+            if (!d->emap.empty()) {
+                py::list opts;
+                for (const auto &p : d->emap) opts.append(p.first);
+                out["options"] = opts;
+            }
+            return out;
+        }, py::arg("name"));
+
     py::class_<PyDocument>(m, "Document")
         // Kept from M0 for continuity:
         .def_property_readonly("object_count", [](const PyDocument &) {
@@ -1259,6 +1422,7 @@ void register_object_model(py::module_ &m)
         .def_property_readonly("printer_config", [](const PyDocument &) {
             return PyConfig{ConfigSource::Printer};
         })
+        .def_property_readonly("settings", [](const PyDocument &) { return PySettings{}; })
         .def_property_readonly("filament_count", [](const PyDocument &) {
             return (int) GUI::wxGetApp().preset_bundle->filament_presets.size();
         })
