@@ -1508,6 +1508,28 @@ void register_object_model(py::module_ &m)
         .def_property("cost",
             [](const PyFilament &f) { return filament_get(f.slot, "filament_cost"); },
             [](const PyFilament &f, py::object v) { filament_set(f.slot, "filament_cost", v); })
+        .def_property_readonly("preset", [](const PyFilament &f) -> py::object {
+            auto *pb = GUI::wxGetApp().preset_bundle;
+            return f.slot < pb->filament_presets.size()
+                ? py::cast(pb->filament_presets[f.slot]) : py::none();
+        })
+        .def("presets", [](const PyFilament &) {
+            main_thread("Filament.presets");
+            py::list out;
+            for (const Preset &p : GUI::wxGetApp().preset_bundle->filaments.get_presets())
+                if (p.is_visible && p.is_compatible) out.append(p.name);
+            return out;
+        })
+        .def("apply_preset", [](const PyFilament &f, const std::string &name) {
+            main_thread("Filament.apply_preset");
+            auto *plater = plater_or_throw("Filament.apply_preset");
+            PresetBundle *pb = GUI::wxGetApp().preset_bundle;
+            if (pb->filaments.find_preset(name) == nullptr)
+                throw std::runtime_error("unknown filament preset: " + name);
+            pb->set_filament_preset(f.slot, name);
+            pb->update_multi_material_filament_presets();
+            plater->on_config_change(pb->full_config());
+        }, py::arg("name"))
         .def("__repr__", [](const PyFilament &f) {
             return "<Filament slot=" + std::to_string(f.slot) + ">"; });
 
