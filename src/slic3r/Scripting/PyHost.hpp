@@ -46,6 +46,12 @@ void maybe_start_m0_selftest();
 // PYSLIC3R_SCRIPT_EXIT=1 for batch use (finalize + exit after the script,
 // exit code reflects success). No-op if PYSLIC3R_SCRIPT is unset. Called by
 // host_init.
+// Agent bridge (M5): if env PYSLIC3R_BRIDGE_PORT is set, start a loopback
+// TCP JSON-RPC listener that relays to pyslic3r._handle_request on the wx
+// main thread. Dispatcher from PYSLIC3R_DISPATCH_FILE (else a minimal ping).
+// No-op if the env is unset. Called by host_init. Loopback-only.
+void maybe_start_bridge();
+
 void maybe_run_user_script();
 
 } // namespace pyslic3r

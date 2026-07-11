@@ -11,6 +11,13 @@
 #include <string>
 
 #include <pybind11/embed.h>
+#include <thread>
+#ifndef _WIN32
+#include <sys/socket.h>
+#include <netinet/in.h>
+#include <arpa/inet.h>
+#include <unistd.h>
+#endif
 
 #include <wx/app.h>
 #include <wx/thread.h>
@@ -108,6 +115,7 @@ void host_init()
     s_initialized = true;
 
     maybe_start_m0_selftest();
+    maybe_start_bridge();
     maybe_run_user_script();
 }
 
@@ -155,6 +163,95 @@ std::string py_eval_str(const std::string &expr)
         out = py::str(res).cast<std::string>();
     });
     return out;
+}
+
+// ---------------------------------------------------------------------------
+// Agent bridge (M5) — loopback TCP + JSON-RPC 2.0 over the façade.
+// ---------------------------------------------------------------------------
+
+static const char *BRIDGE_MINIMAL_PY = R"PY(
+import json as _json, pyslic3r as _ps
+def _handle_request(s):
+    try: req = _json.loads(s)
+    except Exception: return _json.dumps({"jsonrpc":"2.0","id":None,"error":{"code":-32700,"message":"parse error"}})
+    rid = req.get("id")
+    try:
+        if req.get("method") == "ping":
+            r = {"app": _ps.app.name, "version": _ps.app.version, "ok": True, "minimal": True}
+        else:
+            raise RuntimeError("dispatcher not loaded; set PYSLIC3R_DISPATCH_FILE")
+        return _json.dumps({"jsonrpc":"2.0","id":rid,"result":r})
+    except Exception as e:
+        return _json.dumps({"jsonrpc":"2.0","id":rid,"error":{"code":-32000,"message":str(e)}})
+_ps._handle_request = _handle_request
+)PY";
+
+#ifndef _WIN32
+static void bridge_serve(int port)
+{
+    int srv = ::socket(AF_INET, SOCK_STREAM, 0);
+    if (srv < 0) { std::perror("pyslic3r bridge: socket"); return; }
+    int opt = 1; ::setsockopt(srv, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
+    sockaddr_in addr{}; addr.sin_family = AF_INET;
+    addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK); addr.sin_port = htons((uint16_t) port);
+    if (::bind(srv, (sockaddr *) &addr, sizeof(addr)) < 0) { std::perror("pyslic3r bridge: bind"); ::close(srv); return; }
+    ::listen(srv, 4);
+    std::fprintf(stderr, "pyslic3r bridge: listening on 127.0.0.1:%d\n", port); std::fflush(stderr);
+    for (;;) {
+        int c = ::accept(srv, nullptr, nullptr);
+        if (c < 0) continue;
+        std::string buf; char tmp[8192];
+        for (;;) {
+            ssize_t n = ::recv(c, tmp, sizeof(tmp), 0);
+            if (n <= 0) break;
+            buf.append(tmp, (size_t) n);
+            size_t pos;
+            while ((pos = buf.find('\n')) != std::string::npos) {
+                std::string line = buf.substr(0, pos); buf.erase(0, pos + 1);
+                if (line.empty()) continue;
+                std::string resp;
+                try {
+                    run_on_main_blocking([&]() {
+                        py::gil_scoped_acquire gil;
+                        py::object h = py::module_::import("pyslic3r").attr("_handle_request");
+                        resp = h(line).cast<std::string>();
+                    });
+                } catch (const std::exception &e) {
+                    resp = std::string("{\"jsonrpc\":\"2.0\",\"id\":null,\"error\":{\"code\":-32001,\"message\":\"bridge: ")
+                         + e.what() + "\"}}";
+                }
+                resp.push_back('\n');
+                ::send(c, resp.data(), resp.size(), 0);
+            }
+        }
+        ::close(c);
+    }
+}
+#endif
+
+void maybe_start_bridge()
+{
+    const char *ps = std::getenv("PYSLIC3R_BRIDGE_PORT");
+    if (ps == nullptr || *ps == '\0') return;
+    int port = std::atoi(ps);
+    if (port <= 0) return;
+#ifdef _WIN32
+    std::fprintf(stderr, "pyslic3r bridge: not yet ported to Windows (Winsock)\n");
+#else
+    {
+        py::gil_scoped_acquire gil;
+        py::object nsdict = py::module_::import("pyslic3r").attr("__dict__");
+        const char *df = std::getenv("PYSLIC3R_DISPATCH_FILE");
+        try {
+            if (df != nullptr && *df != '\0') py::eval_file(df, nsdict);
+            else py::exec(BRIDGE_MINIMAL_PY, nsdict);
+        } catch (const std::exception &e) {
+            std::fprintf(stderr, "pyslic3r bridge: dispatcher load failed: %s\n", e.what());
+            py::exec(BRIDGE_MINIMAL_PY, nsdict);
+        }
+    }
+    std::thread(bridge_serve, port).detach();
+#endif
 }
 
 // ---------------------------------------------------------------------------
