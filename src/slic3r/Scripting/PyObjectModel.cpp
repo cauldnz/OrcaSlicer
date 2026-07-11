@@ -127,6 +127,7 @@ struct PyModel {};
 struct PyObject   { size_t idx; };
 struct PyVolume   { size_t obj_idx; size_t vol_idx; };
 struct PySettings {};
+struct PyFilament { size_t slot; };
 struct PyText     { size_t obj_idx; size_t vol_idx; };
 struct PyPlateList {};
 struct PyPlate    { int idx; };
@@ -518,6 +519,63 @@ static py::object settings_get(const std::string &name)
         if (d->kind == 'p') { std::string r = raw; if (!r.empty() && r.back() == '%') r.pop_back(); return py::float_(std::stod(r)); }
     } catch (...) { /* fall through to string */ }
     return py::str(raw);   // 'o' (float-or-percent) and any unparsable value
+}
+
+
+// ---- per-slot filament configuration ---------------------------------------
+// Resolve the config carrying a per-filament key: filament preset config, else
+// project_config (colour lives there on Bambu/Orca).
+static DynamicPrintConfig *filament_cfg(const std::string &key)
+{
+    PresetBundle *pb = GUI::wxGetApp().preset_bundle;
+    DynamicPrintConfig &fc = pb->filaments.get_edited_preset().config;
+    if (fc.has(key)) return &fc;
+    if (pb->project_config.has(key)) return &pb->project_config;
+    return nullptr;
+}
+static py::object filament_get(size_t slot, const std::string &key)
+{
+    DynamicPrintConfig *cfg = filament_cfg(key);
+    if (!cfg) return py::none();
+    const ConfigOption *o = cfg->option(key);
+    if (!o) return py::none();
+    // Cast to the ConfigOptionVector<T> template base so this also matches the
+    // *Nullable variants (Bambu/Orca use ConfigOptionIntsNullable etc.).
+    if (auto *ov = dynamic_cast<const ConfigOptionVector<std::string>*>(o))
+        return slot < ov->values.size() ? py::cast(ov->values[slot]) : py::none();
+    if (auto *ov = dynamic_cast<const ConfigOptionVector<int>*>(o))
+        return slot < ov->values.size() ? py::cast(ov->values[slot]) : py::none();
+    if (auto *ov = dynamic_cast<const ConfigOptionVector<double>*>(o))
+        return slot < ov->values.size() ? py::cast(ov->values[slot]) : py::none();
+    if (auto *ov = dynamic_cast<const ConfigOptionVector<unsigned char>*>(o))
+        return slot < ov->values.size() ? py::cast((bool) ov->values[slot]) : py::none();
+    return py::cast(o->serialize());
+}
+static void filament_set(size_t slot, const std::string &key, py::object val)
+{
+    main_thread("Filament.set");
+    auto *plater = plater_or_throw("Filament.set");
+    PresetBundle *pb = GUI::wxGetApp().preset_bundle;
+    DynamicPrintConfig *cfg = filament_cfg(key);
+    if (!cfg) throw std::runtime_error("no filament config carries key: " + key);
+    ConfigOption *o = cfg->option(key, true);
+    if (auto *ov = dynamic_cast<ConfigOptionVector<std::string>*>(o)) {
+        if (slot >= ov->values.size()) ov->values.resize(slot + 1);
+        ov->values[slot] = val.cast<std::string>();
+    } else if (auto *ov = dynamic_cast<ConfigOptionVector<int>*>(o)) {
+        if (slot >= ov->values.size()) ov->values.resize(slot + 1);
+        ov->values[slot] = (int) std::llround(val.cast<double>());
+    } else if (auto *ov = dynamic_cast<ConfigOptionVector<double>*>(o)) {
+        if (slot >= ov->values.size()) ov->values.resize(slot + 1);
+        ov->values[slot] = val.cast<double>();
+    } else if (auto *ov = dynamic_cast<ConfigOptionVector<unsigned char>*>(o)) {
+        if (slot >= ov->values.size()) ov->values.resize(slot + 1);
+        ov->values[slot] = val.cast<bool>() ? 1 : 0;
+    } else {
+        throw std::runtime_error("unsupported filament option type for key: " + key);
+    }
+    if (cfg == &pb->filaments.get_edited_preset().config) pb->filaments.update_dirty();
+    plater->on_config_change(pb->full_config());
 }
 
 } // anonymous namespace
@@ -1420,6 +1478,39 @@ void register_object_model(py::module_ &m)
             return out;
         }, py::arg("name"));
 
+    // ---- Filament (per-slot configuration) --------------------------------
+    py::class_<PyFilament>(m, "Filament")
+        .def_property_readonly("slot", [](const PyFilament &f) { return (int) f.slot; })
+        .def_property("type",
+            [](const PyFilament &f) { return filament_get(f.slot, "filament_type"); },
+            [](const PyFilament &f, py::object v) { filament_set(f.slot, "filament_type", v); })
+        .def_property("color",
+            [](const PyFilament &f) { return filament_get(f.slot, "filament_colour"); },
+            [](const PyFilament &f, py::object v) { filament_set(f.slot, "filament_colour", v); })
+        .def_property("nozzle_temp",
+            [](const PyFilament &f) { return filament_get(f.slot, "nozzle_temperature"); },
+            [](const PyFilament &f, py::object v) { filament_set(f.slot, "nozzle_temperature", v); })
+        .def_property("bed_temp",
+            [](const PyFilament &f) { return filament_get(f.slot, "hot_plate_temp"); },
+            [](const PyFilament &f, py::object v) { filament_set(f.slot, "hot_plate_temp", v); })
+        .def_property("flow_ratio",
+            [](const PyFilament &f) { return filament_get(f.slot, "filament_flow_ratio"); },
+            [](const PyFilament &f, py::object v) { filament_set(f.slot, "filament_flow_ratio", v); })
+        .def_property("max_volumetric_speed",
+            [](const PyFilament &f) { return filament_get(f.slot, "filament_max_volumetric_speed"); },
+            [](const PyFilament &f, py::object v) { filament_set(f.slot, "filament_max_volumetric_speed", v); })
+        .def_property("diameter",
+            [](const PyFilament &f) { return filament_get(f.slot, "filament_diameter"); },
+            [](const PyFilament &f, py::object v) { filament_set(f.slot, "filament_diameter", v); })
+        .def_property("density",
+            [](const PyFilament &f) { return filament_get(f.slot, "filament_density"); },
+            [](const PyFilament &f, py::object v) { filament_set(f.slot, "filament_density", v); })
+        .def_property("cost",
+            [](const PyFilament &f) { return filament_get(f.slot, "filament_cost"); },
+            [](const PyFilament &f, py::object v) { filament_set(f.slot, "filament_cost", v); })
+        .def("__repr__", [](const PyFilament &f) {
+            return "<Filament slot=" + std::to_string(f.slot) + ">"; });
+
     py::class_<PyDocument>(m, "Document")
         // Kept from M0 for continuity:
         .def_property_readonly("object_count", [](const PyDocument &) {
@@ -1440,6 +1531,12 @@ void register_object_model(py::module_ &m)
             return PyConfig{ConfigSource::Printer};
         })
         .def_property_readonly("settings", [](const PyDocument &) { return PySettings{}; })
+        .def_property_readonly("filaments", [](const PyDocument &) {
+            int n = (int) GUI::wxGetApp().preset_bundle->filament_presets.size();
+            py::list out;
+            for (int i = 0; i < n; ++i) out.append(PyFilament{(size_t) i});
+            return out;
+        })
         .def_property_readonly("filament_count", [](const PyDocument &) {
             return (int) GUI::wxGetApp().preset_bundle->filament_presets.size();
         })
