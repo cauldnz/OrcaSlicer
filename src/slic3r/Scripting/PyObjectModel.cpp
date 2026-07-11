@@ -450,6 +450,25 @@ void register_object_model(py::module_ &m)
         .def_property_readonly("is_model_part", [](const PyVolume &v) {
             return volume_at(v, "Volume.is_model_part")->is_model_part();
         })
+        .def("set_type", [](const PyVolume &v, const std::string &type_name) {
+            main_thread("Volume.set_type");
+            auto *plater = plater_or_throw("Volume.set_type");
+            ModelVolume *vol = volume_at(v, "Volume.set_type");
+            ModelObject *obj = object_at(v.obj_idx, "Volume.set_type");
+            const ModelVolumeType type = volume_type_from_str(type_name);
+            // mirror the GUI: keep at least one model part on the object
+            if (vol->is_model_part() && type != ModelVolumeType::MODEL_PART) {
+                int parts = 0;
+                for (const ModelVolume *ov : obj->volumes) if (ov->is_model_part()) ++parts;
+                if (parts <= 1)
+                    throw std::runtime_error("set_type: cannot change the object's only model part");
+            }
+            GUI::Plater::TakeSnapshot snap(plater, std::string("API: change part type"));
+            vol->set_type(type);
+            obj->invalidate_bounding_box();
+            plater->changed_object(int(v.obj_idx));
+            return std::string(volume_type_str(vol->type()));
+        }, py::arg("type"))
         .def_property_readonly("config", [](const PyVolume &v) {
             (void) volume_at(v, "Volume.config");   // bounds-check
             return PyConfig{ConfigSource::Volume, int(v.obj_idx), int(v.vol_idx)};
