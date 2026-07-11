@@ -469,6 +469,15 @@ void register_object_model(py::module_ &m)
             plater->changed_object(int(v.obj_idx));
             return std::string(volume_type_str(vol->type()));
         }, py::arg("type"))
+        .def_property_readonly("is_mm_painted", [](const PyVolume &v) {
+            return volume_at(v, "Volume.is_mm_painted")->is_mm_painted();
+        })
+        .def_property_readonly("is_support_painted", [](const PyVolume &v) {
+            return volume_at(v, "Volume.is_support_painted")->is_fdm_support_painted();
+        })
+        .def_property_readonly("is_seam_painted", [](const PyVolume &v) {
+            return volume_at(v, "Volume.is_seam_painted")->is_seam_painted();
+        })
         .def_property_readonly("config", [](const PyVolume &v) {
             (void) volume_at(v, "Volume.config");   // bounds-check
             return PyConfig{ConfigSource::Volume, int(v.obj_idx), int(v.vol_idx)};
