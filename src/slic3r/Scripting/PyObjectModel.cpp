@@ -842,6 +842,22 @@ void register_object_model(py::module_ &m)
             if (plate == nullptr) throw std::runtime_error("plate gone");
             return plate->can_slice();
         })
+        .def_property("name",
+            [](const PyPlate &p) {
+                auto &list = plater_or_throw("Plate.name")->get_partplate_list();
+                GUI::PartPlate *pl = list.get_plate(p.idx);
+                if (pl == nullptr) throw std::runtime_error("plate gone");
+                return pl->get_plate_name();
+            },
+            [](const PyPlate &p, const std::string &name) {
+                auto &list = plater_or_throw("Plate.name")->get_partplate_list();
+                GUI::PartPlate *pl = list.get_plate(p.idx);
+                if (pl == nullptr) throw std::runtime_error("plate gone");
+                pl->set_plate_name(name);
+            })
+        .def("select", [](const PyPlate &p) {
+            plater_or_throw("Plate.select")->get_partplate_list().select_plate(p.idx);
+        })
         .def_property_readonly("config", [](const PyPlate &p) {
             return PyConfig{ConfigSource::Plate, p.idx};
         })
@@ -953,6 +969,27 @@ void register_object_model(py::module_ &m)
                 wxMilliSleep(40);
             }
         }, py::arg("wait") = false)
+        .def("add", [](const PyPlateList &) {
+            auto &list = plater_or_throw("PlateList.add")->get_partplate_list();
+            list.create_plate();
+            return list.get_plate_count();
+        })
+        .def("remove", [](const PyPlateList &, int idx) {
+            auto &list = plater_or_throw("PlateList.remove")->get_partplate_list();
+            if (idx < 0 || idx >= list.get_plate_count())
+                throw py::index_error("plate index out of range");
+            if (list.get_plate_count() <= 1)
+                throw std::runtime_error("cannot remove the last plate");
+            list.delete_plate(idx);
+            return list.get_plate_count();
+        }, py::arg("index"))
+        .def("select", [](const PyPlateList &, int idx) {
+            auto &list = plater_or_throw("PlateList.select")->get_partplate_list();
+            if (idx < 0 || idx >= list.get_plate_count())
+                throw py::index_error("plate index out of range");
+            list.select_plate(idx);
+            return idx;
+        }, py::arg("index"))
         .def("arrange", [](const PyPlateList &, bool wait) {
             // Auto-arrange, same as the toolbar button. Asynchronous — starts a
             // background ArrangeJob (which snapshots itself). With wait=True,
