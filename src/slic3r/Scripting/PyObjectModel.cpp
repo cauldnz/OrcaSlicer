@@ -698,6 +698,23 @@ void register_object_model(py::module_ &m)
             plater->changed_object(int(o.idx));
             return int(obj->volumes.size() - 1);   // index of the new volume
         }, py::arg("path"), py::arg("type") = "part")
+        .def("convert_units", [](const PyObject &o, const std::string &conversion) {
+            main_thread("Object.convert_units");
+            double f;
+            if      (conversion == "from_inch")  f = 25.4;
+            else if (conversion == "to_inch")    f = 1.0 / 25.4;
+            else if (conversion == "from_meter") f = 1000.0;
+            else if (conversion == "to_meter")   f = 1.0 / 1000.0;
+            else throw std::runtime_error("convert_units: unknown conversion '" + conversion +
+                "' (from_inch/to_inch/from_meter/to_meter)");
+            auto *plater = plater_or_throw("Object.convert_units");
+            ModelObject *obj = object_at(o.idx, "Object.convert_units");
+            GUI::Plater::TakeSnapshot snap(plater, std::string("API: convert units"));
+            obj->scale(Vec3d(f, f, f));
+            obj->invalidate_bounding_box();
+            plater->changed_object(int(o.idx));
+            return f;
+        }, py::arg("conversion"))
         .def("place_on_bed", [](const PyObject &o) {
             auto *plater = plater_or_throw("Object.place_on_bed");
             ModelObject *obj = object_at(o.idx, "Object.place_on_bed");
