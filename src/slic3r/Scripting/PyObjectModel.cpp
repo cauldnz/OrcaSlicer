@@ -868,6 +868,22 @@ void register_object_model(py::module_ &m)
             main_thread("Volume.clear_seam_paint");
             volume_at(v, "Volume.clear_seam_paint")->seam_facets.reset();
         })
+        .def("paint_fuzzy_above", [](const PyVolume &v, double z, const std::string &mode) {
+            main_thread("Volume.paint_fuzzy_above");
+            return paint_ann_band(v, z, std::numeric_limits<double>::max(), eb_mode(mode), &ModelVolume::fuzzy_skin_facets);
+        }, py::arg("z"), py::arg("mode") = "enforce")
+        .def("paint_fuzzy_band", [](const PyVolume &v, double z_min, double z_max, const std::string &mode) {
+            main_thread("Volume.paint_fuzzy_band");
+            if (z_max <= z_min) throw std::runtime_error("paint_fuzzy_band: z_max must be > z_min");
+            return paint_ann_band(v, z_min, z_max, eb_mode(mode), &ModelVolume::fuzzy_skin_facets);
+        }, py::arg("z_min"), py::arg("z_max"), py::arg("mode") = "enforce")
+        .def("clear_fuzzy_paint", [](const PyVolume &v) {
+            main_thread("Volume.clear_fuzzy_paint");
+            volume_at(v, "Volume.clear_fuzzy_paint")->fuzzy_skin_facets.reset();
+        })
+        .def_property_readonly("is_fuzzy_painted", [](const PyVolume &v) {
+            return !volume_at(v, "Volume.is_fuzzy_painted")->fuzzy_skin_facets.empty();
+        })
         .def_property_readonly("config", [](const PyVolume &v) {
             (void) volume_at(v, "Volume.config");   // bounds-check
             return PyConfig{ConfigSource::Volume, int(v.obj_idx), int(v.vol_idx)};
