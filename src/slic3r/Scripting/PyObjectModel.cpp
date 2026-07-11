@@ -578,6 +578,76 @@ static void filament_set(size_t slot, const std::string &key, py::object val)
     plater->on_config_change(pb->full_config());
 }
 
+
+// ---- export current state as a pyslic3r script ------------------------------
+static std::string py_repr(py::object v)
+{
+    return py::str(py::repr(v)).cast<std::string>();
+}
+static std::string build_state_script()
+{
+    PresetBundle *pb = GUI::wxGetApp().preset_bundle;
+    std::string out = "import pyslic3r\ndoc = pyslic3r.app.active_document\n";
+
+    struct Src { ConfigSource src; const char *cfgname; PresetCollection *col; };
+    Src srcs[] = {
+        {ConfigSource::Printer,  "printer_config",  &pb->printers},
+        {ConfigSource::Print,    "print_config",    &pb->prints},
+        {ConfigSource::Filament, "filament_config", &pb->filaments},
+    };
+
+    out += "\n# presets\n";
+    for (auto &sc : srcs)
+        out += std::string("doc.") + sc.cfgname + ".apply_preset("
+             + py_repr(py::cast(sc.col->get_selected_preset_name())) + ")\n";
+
+    // filaments (colours) when multi-colour
+    int nfil = (int) pb->filament_presets.size();
+    if (nfil > 1) {
+        out += "\n# filaments\n";
+        std::string colors = "[";
+        for (int i = 0; i < nfil; ++i) {
+            py::object c = filament_get((size_t) i, "filament_colour");
+            std::string cs = c.is_none() ? std::string("#FFFFFF") : c.cast<std::string>();
+            colors += (i ? ", " : "") + py_repr(py::cast(cs));
+        }
+        colors += "]";
+        out += "doc.set_filaments(" + colors + ")\n";
+    }
+
+    // gather dirty keys per source
+    std::map<std::string, const char*> dirty;             // key -> cfgname
+    std::map<std::string, PresetCollection*> dirty_col;   // key -> collection
+    for (auto &sc : srcs)
+        for (const std::string &k : sc.col->current_dirty_options()) {
+            dirty[k] = sc.cfgname;
+            dirty_col[k] = sc.col;
+        }
+
+    out += "\n# settings (changed from the selected presets)\n";
+    std::set<std::string> handled;
+    for (const auto &d : settings_defs()) {
+        if (dirty.count(d.key) && !handled.count(d.key)) {
+            py::object v = settings_get(d.name);
+            if (!v.is_none()) {
+                out += "doc.settings.set(" + py_repr(py::cast(d.name)) + ", " + py_repr(v) + ")\n";
+                handled.insert(d.key);
+            }
+        }
+    }
+    // raw leftovers (dirty keys with no curated name)
+    bool any_raw = false;
+    for (const auto &kv : dirty) {
+        if (handled.count(kv.first)) continue;
+        if (!any_raw) { out += "\n# other changed settings (raw keys)\n"; any_raw = true; }
+        DynamicPrintConfig &cfg = dirty_col[kv.first]->get_edited_preset().config;
+        out += std::string("doc.") + kv.second + ".set("
+             + py_repr(py::cast(kv.first)) + ", "
+             + py_repr(py::cast(cfg.opt_serialize(kv.first))) + ")\n";
+    }
+    return out;
+}
+
 } // anonymous namespace
 
 // ---------------------------------------------------------------------------
@@ -597,6 +667,13 @@ void register_object_model(py::module_ &m)
         })
         .def("keys", [](const PyConfig &c) {
             return resolve_config(c, "Config.keys")->keys();   // -> list[str]
+        })
+        .def("dirty_keys", [](const PyConfig &c) {
+            main_thread("Config.dirty_keys");
+            PresetCollection *col = preset_collection(c.source);
+            py::list out;
+            if (col != nullptr) for (const std::string &k : col->current_dirty_options()) out.append(k);
+            return out;
         })
         .def_property_readonly("is_dirty", [](const PyConfig &c) {
             PresetCollection *col = preset_collection(c.source);
@@ -1655,6 +1732,10 @@ void register_object_model(py::module_ &m)
                 /*ask_multi=*/false);
             return plater->model().objects.size();
         }, py::arg("path"))
+        .def("to_script", [](const PyDocument &) {
+            main_thread("Document.to_script");
+            return build_state_script();
+        })
         .def("save_3mf", [](const PyDocument &, const std::string &path) {
             namespace fs = boost::filesystem;
             auto *plater = plater_or_throw("Document.save_3mf");
