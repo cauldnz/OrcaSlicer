@@ -258,6 +258,46 @@ static int mmu_paint_band(const PyVolume &v, double z_lo, double z_hi, int extru
     return painted;
 }
 
+// Generic facet-annotation paint: paint original facets whose world-Z centroid is
+// in (z_lo, z_hi] with `state`, into the given FacetsAnnotation member. Composes
+// with existing paint. Shared by support + seam (MMU has its own extruder wrapper).
+static int paint_ann_band(const PyVolume &v, double z_lo, double z_hi,
+                          EnforcerBlockerType state, FacetsAnnotation ModelVolume::*member)
+{
+    ModelObject *obj = object_at(v.obj_idx, "Volume.paint");
+    ModelVolume *vol = volume_at(v, "Volume.paint");
+    const TriangleMesh &mesh = vol->mesh();
+    const indexed_triangle_set &its = mesh.its;
+    if (its.indices.empty())
+        throw std::runtime_error("paint: volume has no mesh");
+    Transform3d tr = vol->get_matrix();
+    if (!obj->instances.empty())
+        tr = obj->instances[0]->get_matrix() * tr;
+    FacetsAnnotation &facets = vol->*member;
+    TriangleSelector selector(mesh);
+    if (!facets.get_data().triangles_to_split.empty())
+        selector.deserialize(facets.get_data(), false);
+    int painted = 0;
+    for (size_t i = 0; i < its.indices.size(); ++i) {
+        const auto &t = its.indices[i];
+        const Vec3d c = (its.vertices[t[0]].cast<double>() + its.vertices[t[1]].cast<double>() +
+                         its.vertices[t[2]].cast<double>()) / 3.0;
+        const double wz = (tr * c).z();
+        if (wz > z_lo && wz <= z_hi) { selector.set_facet(int(i), state); ++painted; }
+    }
+    facets.set(selector);
+    return painted;
+}
+
+// "enforce"/"block" -> ENFORCER/BLOCKER
+static EnforcerBlockerType eb_mode(const std::string &mode)
+{
+    if (mode == "enforce" || mode == "enforcer") return EnforcerBlockerType::ENFORCER;
+    if (mode == "block"   || mode == "blocker")  return EnforcerBlockerType::BLOCKER;
+    throw std::runtime_error("mode must be 'enforce' or 'block'");
+}
+
+
 
 // Resolve a text handle -> ModelVolume, asserting it is editable text.
 ModelVolume *text_at(const PyText &t, const char *what)
@@ -524,6 +564,32 @@ void register_object_model(py::module_ &m)
         .def("clear_mmu_paint", [](const PyVolume &v) {
             main_thread("Volume.clear_mmu_paint");
             volume_at(v, "Volume.clear_mmu_paint")->mmu_segmentation_facets.reset();
+        })
+        .def("paint_support_above", [](const PyVolume &v, double z, const std::string &mode) {
+            main_thread("Volume.paint_support_above");
+            return paint_ann_band(v, z, std::numeric_limits<double>::max(), eb_mode(mode), &ModelVolume::supported_facets);
+        }, py::arg("z"), py::arg("mode") = "enforce")
+        .def("paint_support_band", [](const PyVolume &v, double z_min, double z_max, const std::string &mode) {
+            main_thread("Volume.paint_support_band");
+            if (z_max <= z_min) throw std::runtime_error("paint_support_band: z_max must be > z_min");
+            return paint_ann_band(v, z_min, z_max, eb_mode(mode), &ModelVolume::supported_facets);
+        }, py::arg("z_min"), py::arg("z_max"), py::arg("mode") = "enforce")
+        .def("clear_support_paint", [](const PyVolume &v) {
+            main_thread("Volume.clear_support_paint");
+            volume_at(v, "Volume.clear_support_paint")->supported_facets.reset();
+        })
+        .def("paint_seam_above", [](const PyVolume &v, double z, const std::string &mode) {
+            main_thread("Volume.paint_seam_above");
+            return paint_ann_band(v, z, std::numeric_limits<double>::max(), eb_mode(mode), &ModelVolume::seam_facets);
+        }, py::arg("z"), py::arg("mode") = "enforce")
+        .def("paint_seam_band", [](const PyVolume &v, double z_min, double z_max, const std::string &mode) {
+            main_thread("Volume.paint_seam_band");
+            if (z_max <= z_min) throw std::runtime_error("paint_seam_band: z_max must be > z_min");
+            return paint_ann_band(v, z_min, z_max, eb_mode(mode), &ModelVolume::seam_facets);
+        }, py::arg("z_min"), py::arg("z_max"), py::arg("mode") = "enforce")
+        .def("clear_seam_paint", [](const PyVolume &v) {
+            main_thread("Volume.clear_seam_paint");
+            volume_at(v, "Volume.clear_seam_paint")->seam_facets.reset();
         })
         .def_property_readonly("config", [](const PyVolume &v) {
             (void) volume_at(v, "Volume.config");   // bounds-check
