@@ -30,6 +30,7 @@
 #include "libslic3r/TriangleSelector.hpp"   // facet paint (MMU)
 #include "libslic3r/QuadricEdgeCollapse.hpp"   // object.simplify
 #include "libslic3r/TriangleMesh.hpp"   // its_volume (object.measure)
+#include "libslic3r/MeshBoolean.hpp"     // object.boolean
 #include <limits>
 #include "libslic3r/Format/STL.hpp"   // store_stl (export_stl)
 #include "libslic3r/Shape/TextShape.hpp"   // load_text_shape / TextResult (editable text)
@@ -668,6 +669,22 @@ static double object_max_z(const ModelObject *obj)
     return zmax;
 }
 
+// Merged world-space mesh of an object's model-part volumes (instance[0] frame)
+// — the geometry a user sees on the plate. Used as boolean operands.
+static TriangleMesh object_world_mesh(const ModelObject *obj)
+{
+    TriangleMesh out;
+    const Transform3d inst = obj->instances.empty() ? Transform3d::Identity()
+                                                     : obj->instances[0]->get_matrix();
+    for (const ModelVolume *v : obj->volumes) {
+        if (!v->is_model_part()) continue;
+        TriangleMesh m(v->mesh());
+        m.transform(inst * v->get_matrix(), true);
+        out.merge(m);
+    }
+    return out;
+}
+
 } // anonymous namespace
 
 // ---------------------------------------------------------------------------
@@ -1209,6 +1226,49 @@ void register_object_model(py::module_ &m)
             plater->changed_object(int(o.idx));
             return (int)(obj->layer_height_profile.get().size() / 2);
         }, py::arg("quality") = 0.5)
+        .def("boolean", [](const PyObject &o, const PyObject &other, const std::string &op) {
+            main_thread("Object.boolean");
+            if (o.idx == other.idx) throw std::runtime_error("boolean: the other object must be different");
+            auto *plater = plater_or_throw("Object.boolean");
+            ModelObject *A = object_at(o.idx, "Object.boolean");
+            ModelObject *B = object_at(other.idx, "Object.boolean");
+            TriangleMesh meshA = object_world_mesh(A);
+            TriangleMesh meshB = object_world_mesh(B);
+            if (meshA.its.indices.empty() || meshB.its.indices.empty())
+                throw std::runtime_error("boolean: both objects must have model-part geometry");
+            if (op == "union" || op == "plus")
+                MeshBoolean::cgal::plus(meshA, meshB);
+            else if (op == "difference" || op == "minus")
+                MeshBoolean::cgal::minus(meshA, meshB);
+            else if (op == "intersection" || op == "intersect")
+                MeshBoolean::cgal::intersect(meshA, meshB);
+            else
+                throw std::runtime_error("boolean: op must be union | difference | intersection");
+            plater->clear_before_change_mesh(int(o.idx));
+            // Write the world result back into A's first model-part volume (local frame).
+            ModelVolume *v0 = nullptr;
+            for (ModelVolume *v : A->volumes) if (v->is_model_part()) { v0 = v; break; }
+            if (v0 == nullptr) throw std::runtime_error("boolean: object A has no model-part volume");
+            const Transform3d inst = A->instances.empty() ? Transform3d::Identity()
+                                                          : A->instances[0]->get_matrix();
+            const Transform3d full = inst * v0->get_matrix();
+            meshA.transform(full.inverse(), true);
+            v0->set_mesh(std::move(meshA));
+            v0->calculate_convex_hull();
+            v0->set_new_unique_id();
+            // Drop A's now-redundant extra model-part volumes (v0 holds the merged result).
+            for (int i = (int) A->volumes.size() - 1; i >= 0; --i)
+                if (A->volumes[i] != v0 && A->volumes[i]->is_model_part())
+                    A->delete_volume((size_t) i);
+            A->invalidate_bounding_box();
+            A->ensure_on_bed();
+            plater->changed_mesh(int(o.idx));
+            plater->delete_object_from_model(other.idx);   // remove operand B (snapshots)
+            int total = 0;
+            for (const ModelVolume *v : A->volumes)
+                if (v->is_model_part()) total += (int) v->mesh().its.indices.size();
+            return total;
+        }, py::arg("other"), py::arg("op"))
         .def("measure", [](const PyObject &o) {
             ModelObject *obj = object_at(o.idx, "Object.measure");
             double vol = 0.0, area = 0.0; int tris = 0;
