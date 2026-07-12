@@ -1777,6 +1777,75 @@ void register_object_model(py::module_ &m)
             plate->update_slice_result_valid_state(false);
             plater->schedule_background_process();
         }, py::arg("changes"))
+        .def("set_custom_gcodes", [](const PyPlate &p, py::list items) {
+            auto *plater = plater_or_throw("Plate.set_custom_gcodes");
+            auto &list = plater->get_partplate_list();
+            GUI::PartPlate *plate = list.get_plate(p.idx);
+            if (plate == nullptr) throw std::runtime_error("plate gone");
+            std::vector<std::string> ext_colors = plater->get_extruder_colors_from_plater_config();
+            CustomGCode::Info info;
+            info.mode = CustomGCode::Undef;
+            for (auto handle : items) {
+                py::dict d = handle.cast<py::dict>();
+                if (!d.contains("z")) throw std::runtime_error("each marker needs a z (print_z)");
+                CustomGCode::Item item;
+                item.print_z = d["z"].cast<double>();
+                const std::string t = d.contains("type") ? d["type"].cast<std::string>() : std::string("custom");
+                if (t == "pause") {
+                    item.type = CustomGCode::PausePrint;
+                    item.extruder = 0;
+                    item.extra = (d.contains("message") && !d["message"].is_none()) ? d["message"].cast<std::string>() : std::string();
+                } else if (t == "custom") {
+                    if (!d.contains("gcode")) throw std::runtime_error("a custom marker needs a gcode string");
+                    item.type = CustomGCode::Custom;
+                    item.extruder = 0;
+                    item.extra = d["gcode"].cast<std::string>();
+                } else if (t == "color" || t == "tool") {
+                    item.type = (t == "color") ? CustomGCode::ColorChange : CustomGCode::ToolChange;
+                    item.extruder = d.contains("extruder") ? d["extruder"].cast<int>() : 1;
+                    if (item.extruder < 1) throw std::runtime_error("extruder is 1-based; must be >= 1");
+                    if (d.contains("color") && !d["color"].is_none()) { item.color = d["color"].cast<std::string>(); }
+                    else { const int i0 = item.extruder - 1; item.color = (i0 >= 0 && i0 < (int) ext_colors.size()) ? ext_colors[i0] : std::string("#FFFFFF"); }
+                } else {
+                    throw std::runtime_error("type must be pause | custom | color | tool");
+                }
+                info.gcodes.push_back(std::move(item));
+            }
+            std::sort(info.gcodes.begin(), info.gcodes.end());
+            CustomGCode::check_mode_for_custom_gcode_per_print_z(info);
+            GUI::Plater::TakeSnapshot snap(plater, std::string("API: set custom G-code"));
+            plater->model().plates_custom_gcodes[plate->get_index()] = std::move(info);
+            plate->update_slice_result_valid_state(false);
+            plater->schedule_background_process();
+        }, py::arg("items"))
+        .def("custom_gcodes", [](const PyPlate &p) {
+            auto *plater = plater_or_throw("Plate.custom_gcodes");
+            auto &list = plater->get_partplate_list();
+            GUI::PartPlate *plate = list.get_plate(p.idx);
+            if (plate == nullptr) throw std::runtime_error("plate gone");
+            py::list out;
+            auto &m = plater->model().plates_custom_gcodes;
+            auto it = m.find(plate->get_index());
+            if (it == m.end()) return out;
+            for (const CustomGCode::Item &item : it->second.gcodes) {
+                py::dict d;
+                d["z"] = item.print_z;
+                const char *ts = "custom";
+                switch (item.type) {
+                    case CustomGCode::ColorChange: ts = "color"; break;
+                    case CustomGCode::PausePrint:  ts = "pause"; break;
+                    case CustomGCode::ToolChange:  ts = "tool";  break;
+                    case CustomGCode::Template:    ts = "template"; break;
+                    default: ts = "custom"; break;
+                }
+                d["type"] = std::string(ts);
+                d["extruder"] = item.extruder;
+                d["color"] = item.color;
+                d["extra"] = item.extra;
+                out.append(d);
+            }
+            return out;
+        })
         .def("clear_color_changes", [](const PyPlate &p) {
             auto *plater = plater_or_throw("Plate.clear_color_changes");
             auto &list = plater->get_partplate_list();
