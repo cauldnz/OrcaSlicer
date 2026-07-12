@@ -1252,6 +1252,48 @@ void register_object_model(py::module_ &m)
             plater->apply_cut_object_to_model(o.idx, new_objects);
             return model_or_throw("Object.cut").objects.size();
         }, py::arg("z"), py::arg("keep_upper") = true, py::arg("keep_lower") = true)
+
+        .def("cut_with_connectors", [](const PyObject &o, double z, py::iterable connectors,
+                                       bool keep_upper, bool keep_lower) {
+            main_thread("Object.cut_with_connectors");
+            auto *plater = plater_or_throw("Object.cut_with_connectors");
+            ModelObject *obj = object_at(o.idx, "Object.cut_with_connectors");
+            if (obj->instances.empty())
+                throw std::runtime_error("cut_with_connectors: object has no instances");
+            const Vec3d off = obj->instances[0]->get_offset();
+            GUI::Plater::TakeSnapshot snap(plater, std::string("API: cut with connectors"));
+            // Each connector: a NEGATIVE_VOLUME frustum straddling the cut plane, flagged
+            // as a connector so the Cut engine turns it into a plug (lower) + hole (upper).
+            int nconn = 0;
+            for (py::handle item : connectors) {
+                py::sequence c = item.cast<py::sequence>();   // (x, y, diameter, depth)
+                const double cx = c[0].cast<double>();
+                const double cy = c[1].cast<double>();
+                const double diameter = c[2].cast<double>();
+                const double depth = c[3].cast<double>();
+                if (diameter <= 0.0 || depth <= 0.0)
+                    throw std::runtime_error("cut_with_connectors: diameter and depth must be > 0");
+                const double radius = diameter / 2.0;
+                TriangleMesh mesh(its_make_cylinder(1.0, 1.0));   // unit; scaled below
+                ModelVolume *nv = obj->add_volume(std::move(mesh), ModelVolumeType::NEGATIVE_VOLUME);
+                const Vec3d local_pos(cx - off.x(), cy - off.y(), (z - off.z()) - depth / 2.0);
+                nv->set_transformation(Geometry::translation_transform(local_pos) *
+                                       Geometry::scale_transform(Vec3d(radius, radius, depth)));
+                nv->cut_info = ModelVolume::CutInfo(CutConnectorType::Plug, 0.0f, 0.1f);
+                nv->name = "connector-" + std::to_string(++nconn);
+            }
+            if (nconn == 0)
+                throw std::runtime_error("cut_with_connectors: no connectors given");
+            ModelObjectCutAttributes attrs =
+                only_if(keep_upper, ModelObjectCutAttribute::KeepUpper) |
+                only_if(keep_lower, ModelObjectCutAttribute::KeepLower) |
+                only_if(true,       ModelObjectCutAttribute::CreateDowels);
+            const Transform3d cut_matrix = Geometry::translation_transform(Vec3d(0.0, 0.0, z - off.z()));
+            Slic3r::Cut cut(obj, 0, cut_matrix, attrs);
+            const ModelObjectPtrs &new_objects = cut.perform_with_plane();
+            plater->apply_cut_object_to_model(o.idx, new_objects);
+            return model_or_throw("Object.cut_with_connectors").objects.size();
+        }, py::arg("z"), py::arg("connectors"), py::arg("keep_upper") = true, py::arg("keep_lower") = true)
         .def("add_part", [](const PyObject &o, const std::string &path,
                             const std::string &type_name) {
             main_thread("Object.add_part");
