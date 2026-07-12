@@ -31,6 +31,7 @@
 #include "libslic3r/QuadricEdgeCollapse.hpp"   // object.simplify
 #include "libslic3r/TriangleMesh.hpp"   // its_volume (object.measure)
 #include "libslic3r/MeshBoolean.hpp"     // object.boolean
+#include "libslic3r/BuildVolume.hpp"     // object.center (bed_center)
 #include "libslic3r/NSVGUtils.hpp"      // object.emboss_svg (SVG -> shapes)
 #include "libslic3r/Emboss.hpp"         // object.emboss_svg (shapes -> mesh)
 #include "libslic3r/ClipperUtils.hpp"   // union_ex (object.emboss_svg)
@@ -1443,6 +1444,62 @@ void register_object_model(py::module_ &m)
             plater->changed_object(int(o.idx));
             return PyVolume{ o.idx, obj->volumes.size() - 1 };
         }, py::arg("path"), py::arg("depth") = 2.0)
+        .def("repair", [](const PyObject &o) {
+            main_thread("Object.repair");
+            auto *plater = plater_or_throw("Object.repair");
+            ModelObject *obj = object_at(o.idx, "Object.repair");
+            GUI::Plater::TakeSnapshot snap(plater, std::string("API: repair"));
+            plater->clear_before_change_mesh(int(o.idx));
+            int merged = 0, removed = 0, tris = 0;
+            for (ModelVolume *mv : obj->volumes) {
+                if (!mv->is_model_part()) continue;
+                indexed_triangle_set its = mv->mesh().its;   // editable copy
+                merged  += its_merge_vertices(its);
+                removed += its_remove_degenerate_faces(its);
+                its_compactify_vertices(its);
+                TriangleMesh tm(its);
+                mv->set_mesh(std::move(tm));
+                mv->calculate_convex_hull();
+                mv->set_new_unique_id();
+                tris += (int) mv->mesh().its.indices.size();
+            }
+            obj->invalidate_bounding_box();
+            obj->ensure_on_bed();
+            plater->changed_mesh(int(o.idx));
+            py::dict d;
+            d["merged_vertices"] = merged;
+            d["removed_faces"]   = removed;
+            d["triangles"]       = tris;
+            return d;
+        })
+        .def("set_printable", [](const PyObject &o, bool printable) {
+            main_thread("Object.set_printable");
+            auto *plater = plater_or_throw("Object.set_printable");
+            ModelObject *obj = object_at(o.idx, "Object.set_printable");
+            GUI::Plater::TakeSnapshot snap(plater, std::string("API: set printable"));
+            for (ModelInstance *inst : obj->instances) inst->printable = printable;
+            plater->changed_object(int(o.idx));
+            return printable;
+        }, py::arg("printable"))
+        .def_property_readonly("is_printable", [](const PyObject &o) {
+            ModelObject *obj = object_at(o.idx, "Object.is_printable");
+            if (obj->instances.empty()) return false;
+            for (const ModelInstance *inst : obj->instances) if (!inst->printable) return false;
+            return true;
+        })
+        .def("center", [](const PyObject &o) {
+            main_thread("Object.center");
+            auto *plater = plater_or_throw("Object.center");
+            ModelObject *obj = object_at(o.idx, "Object.center");
+            if (obj->instances.empty()) throw std::runtime_error("center: object has no instances");
+            GUI::Plater::TakeSnapshot snap(plater, std::string("API: center on bed"));
+            const auto bc = plater->build_volume().bed_center();
+            const Vec3d cur = obj->instances[0]->get_offset();
+            obj->instances[0]->set_offset(Vec3d(bc.x(), bc.y(), cur.z()));
+            obj->invalidate_bounding_box();
+            obj->ensure_on_bed();
+            plater->changed_object(int(o.idx));
+        })
         .def("measure", [](const PyObject &o) {
             ModelObject *obj = object_at(o.idx, "Object.measure");
             double vol = 0.0, area = 0.0; int tris = 0;
