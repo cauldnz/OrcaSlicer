@@ -1500,6 +1500,31 @@ void register_object_model(py::module_ &m)
             obj->ensure_on_bed();
             plater->changed_object(int(o.idx));
         })
+        .def("replace_mesh", [](const PyObject &o, const std::string &path) {
+            main_thread("Object.replace_mesh");
+            auto *plater = plater_or_throw("Object.replace_mesh");
+            ModelObject *obj = object_at(o.idx, "Object.replace_mesh");
+            Model tmp;
+            if (!load_stl(path.c_str(), &tmp))
+                throw std::runtime_error("replace_mesh: could not load STL: " + path);
+            if (tmp.objects.empty() || tmp.objects.front()->volumes.empty())
+                throw std::runtime_error("replace_mesh: no geometry in " + path);
+            tmp.objects.front()->center_around_origin();
+            TriangleMesh new_mesh = tmp.objects.front()->volumes.front()->mesh();
+            ModelVolume *v0 = nullptr;
+            for (ModelVolume *v : obj->volumes) if (v->is_model_part()) { v0 = v; break; }
+            if (v0 == nullptr) throw std::runtime_error("replace_mesh: object has no model part");
+            GUI::Plater::TakeSnapshot snap(plater, std::string("API: replace mesh"));
+            plater->clear_before_change_mesh(int(o.idx));
+            v0->set_mesh(std::move(new_mesh));   // keeps the volume transform + config + type
+            v0->calculate_convex_hull();
+            v0->set_new_unique_id();
+            v0->name = boost::filesystem::path(path).stem().string();
+            obj->invalidate_bounding_box();
+            obj->ensure_on_bed();
+            plater->changed_mesh(int(o.idx));
+            return (int) v0->mesh().its.indices.size();
+        }, py::arg("path"))
         .def("measure", [](const PyObject &o) {
             ModelObject *obj = object_at(o.idx, "Object.measure");
             double vol = 0.0, area = 0.0; int tris = 0;
