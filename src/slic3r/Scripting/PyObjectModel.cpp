@@ -1586,6 +1586,31 @@ void register_object_model(py::module_ &m)
             return out;
         })
         // ---- M2 mutation --------------------------------------------------
+        .def("add_svg", [](const PyModel &, const std::string &path, double depth) {
+            main_thread("Model.add_svg");
+            auto *plater = plater_or_throw("Model.add_svg");
+            Model &model = model_or_throw("Model.add_svg");
+            TriangleMesh mesh = svg_to_mesh(path, depth);   // may throw before we mutate
+            namespace fs = boost::filesystem;
+            const std::string stem = fs::path(path).stem().string();
+            const fs::path tmp = fs::temp_directory_path() / (stem + "_pyslic3r_svg.stl");
+            if (!mesh.write_binary(tmp.string().c_str()))
+                throw std::runtime_error("add_svg: could not write a temp STL");
+            GUI::Plater::TakeSnapshot snap(plater, std::string("API: add SVG object"));
+            std::vector<fs::path> paths{ tmp };
+            const size_t before = model.objects.size();
+            const auto strategy = LoadStrategy::LoadModel |
+                                  LoadStrategy::AddDefaultInstances |
+                                  LoadStrategy::Silence;
+            std::vector<size_t> idxs = plater->load_files(paths, strategy, /*ask_multi=*/false);
+            fs::remove(tmp);
+            const size_t after = model.objects.size();
+            if (after <= before)
+                throw std::runtime_error("add_svg: load failed for " + path);
+            const size_t new_idx = idxs.empty() ? after - 1 : idxs.back();
+            model.objects[new_idx]->name = stem;
+            return PyObject{ new_idx };
+        }, py::arg("path"), py::arg("depth") = 2.0)
         .def("add", [](const PyModel &, const std::string &path) {
             // Import geometry as object(s) via the same Plater path as GUI
             // "Add" (LoadModel, no LoadConfig, Silence), under a snapshot.
