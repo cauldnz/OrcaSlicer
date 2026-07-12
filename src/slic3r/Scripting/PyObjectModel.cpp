@@ -2222,6 +2222,22 @@ void register_object_model(py::module_ &m)
             d["error"] = err;
             return d;
         })
+        .def_property_readonly("bed", [](const PyDocument &) {
+            auto *plater = plater_or_throw("Document.bed");
+            const BuildVolume &bv = plater->build_volume();
+            const BoundingBoxf3 &bb = bv.bounding_volume();
+            const Vec2d c = bv.bed_center();
+            py::dict d;
+            d["size"]   = vec3(bb.size());
+            d["min"]    = vec3(bb.min);
+            d["max"]    = vec3(bb.max);
+            d["center"] = py::make_tuple(c.x(), c.y());
+            d["height"] = bv.printable_height();
+            py::list shape;
+            for (const Vec2d &pt : bv.printable_area()) shape.append(py::make_tuple(pt.x(), pt.y()));
+            d["shape"] = shape;
+            return d;
+        })
         .def("slice", [](const PyDocument &, py::object plate) {
             auto *plater = plater_or_throw("Document.slice");
             auto &list = plater->get_partplate_list();
