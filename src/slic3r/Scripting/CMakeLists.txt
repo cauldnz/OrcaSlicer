@@ -11,11 +11,13 @@ add_library(libbambu_api STATIC
     PyHost.cpp
     PyBindings.hpp
     PyObjectModel.cpp
+    PyDeviceHost.cpp
     M0SelfTest.cpp
 )
 
-# Orca port: device plane decoupled (Orca's device layer diverged).
-target_compile_definitions(libbambu_api PRIVATE PYSLIC3R_NO_DEVICE=1)
+# Orca open device plane: bound over the PrintHost HTTP layer
+# (PyDeviceHost.cpp), not Bambu MQTT. The Bambu PyDevice.cpp is carried
+# but not compiled here.
 
 # Same include roots as libslic3r_gui: src/ is the include root
 # ("slic3r/GUI/GUI_App.hpp", "libslic3r/Model.hpp"). Utils/ is on the path
