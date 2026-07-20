@@ -718,6 +718,19 @@ static TriangleMesh svg_to_mesh(const std::string &path, double depth_mm)
 
 // ---------------------------------------------------------------------------
 
+static void delete_object_synced(GUI::Plater *plater, size_t obj_idx)
+{
+    // delete_object_from_model updates only the Model (+ PartPlateList); the GUI
+    // always pairs it with ObjectList::delete_object_from_list to drop the matching
+    // ObjectDataViewModel node (see Plater::priv::remove / delete_from_model_and_list).
+    // Skipping the tree removal leaves a stale node, and the next add_object_to_list
+    // (e.g. Object.duplicate) then indexes object(obj_idx) out of bounds inside
+    // add_layer_root_item -> add_layer_item (SIGSEGV). Keep model and tree in sync.
+    plater->delete_object_from_model(obj_idx);
+    if (auto *ol = GUI::wxGetApp().obj_list())
+        ol->delete_object_from_list(obj_idx);
+}
+
 void register_object_model(py::module_ &m)
 {
     // ---- Config -----------------------------------------------------------
@@ -1164,7 +1177,7 @@ void register_object_model(py::module_ &m)
         .def("delete", [](const PyObject &o) {
             auto *plater = plater_or_throw("Object.delete");
             (void) object_at(o.idx, "Object.delete");     // bounds-check
-            plater->delete_object_from_model(o.idx);      // snapshots internally
+            delete_object_synced(plater, o.idx);      // snapshots internally
         })
         // ---- transforms (UI-parity: the rotate / scale / mirror gizmos and
         //      the "set number of instances" action) --------------------------
@@ -1424,7 +1437,7 @@ void register_object_model(py::module_ &m)
             A->invalidate_bounding_box();
             A->ensure_on_bed();
             plater->changed_mesh(int(o.idx));
-            plater->delete_object_from_model(other.idx);   // remove operand B (snapshots)
+            delete_object_synced(plater, other.idx);   // remove operand B (snapshots)
             int total = 0;
             for (const ModelVolume *v : A->volumes)
                 if (v->is_model_part()) total += (int) v->mesh().its.indices.size();
@@ -1712,7 +1725,7 @@ void register_object_model(py::module_ &m)
         .def("remove", [](const PyModel &, const PyObject &o) {
             auto *plater = plater_or_throw("Model.remove");
             (void) object_at(o.idx, "Model.remove");       // bounds-check
-            plater->delete_object_from_model(o.idx);        // snapshots internally
+            delete_object_synced(plater, o.idx);        // snapshots internally
         }, py::arg("object"))
         // ---- clear the scene (UI-parity: Edit -> Delete All) ---------------
         .def("clear", [](const PyModel &) {
