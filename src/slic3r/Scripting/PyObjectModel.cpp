@@ -1538,6 +1538,45 @@ void register_object_model(py::module_ &m)
             plater->changed_mesh(int(o.idx));
             return (int) v0->mesh().its.indices.size();
         }, py::arg("path"))
+        .def_property_readonly("source_file", [](const PyObject &o) {
+            ModelObject *obj = object_at(o.idx, "Object.source_file");
+            for (const ModelVolume *v : obj->volumes)
+                if (v->is_model_part() && !v->source.input_file.empty())
+                    return v->source.input_file;
+            return obj->input_file;
+        })
+        .def("reload_from_disk", [](const PyObject &o) {
+            main_thread("Object.reload_from_disk");
+            auto *plater = plater_or_throw("Object.reload_from_disk");
+            ModelObject *obj = object_at(o.idx, "Object.reload_from_disk");
+            ModelVolume *v0 = nullptr;
+            std::string path;
+            for (ModelVolume *v : obj->volumes) {
+                if (!v->is_model_part()) continue;
+                if (v0 == nullptr) v0 = v;
+                if (!v->source.input_file.empty()) { v0 = v; path = v->source.input_file; break; }
+            }
+            if (path.empty()) path = obj->input_file;
+            if (path.empty()) throw std::runtime_error("reload_from_disk: object has no source file");
+            if (v0 == nullptr) throw std::runtime_error("reload_from_disk: object has no model part");
+            if (!boost::filesystem::exists(path)) throw std::runtime_error("reload_from_disk: source file missing: " + path);
+            Model tmp;
+            if (!load_stl(path.c_str(), &tmp))
+                throw std::runtime_error("reload_from_disk: could not reload (STL sources only): " + path);
+            if (tmp.objects.empty() || tmp.objects.front()->volumes.empty())
+                throw std::runtime_error("reload_from_disk: no geometry in " + path);
+            tmp.objects.front()->center_around_origin();
+            TriangleMesh new_mesh = tmp.objects.front()->volumes.front()->mesh();
+            GUI::Plater::TakeSnapshot snap(plater, std::string("API: reload from disk"));
+            plater->clear_before_change_mesh(int(o.idx));
+            v0->set_mesh(std::move(new_mesh));   // keeps the volume transform + config + type
+            v0->calculate_convex_hull();
+            v0->set_new_unique_id();
+            obj->invalidate_bounding_box();
+            obj->ensure_on_bed();
+            plater->changed_mesh(int(o.idx));
+            return (int) v0->mesh().its.indices.size();
+        })
         .def("measure", [](const PyObject &o) {
             ModelObject *obj = object_at(o.idx, "Object.measure");
             double vol = 0.0, area = 0.0; int tris = 0;
