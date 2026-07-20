@@ -15,12 +15,8 @@
 #include <mutex>
 #include <condition_variable>
 #include <deque>
-#ifndef _WIN32
-#include <sys/socket.h>
-#include <netinet/in.h>
-#include <arpa/inet.h>
-#include <unistd.h>
-#endif
+#include <boost/asio.hpp>   // bridge listener — cross-platform TCP loopback
+#include <memory>
 
 #include <wx/app.h>
 #include <wx/thread.h>
@@ -88,9 +84,10 @@ PYBIND11_EMBEDDED_MODULE(pyslic3r, m)
     register_object_model(m);
 #ifndef PYSLIC3R_NO_DEVICE
     register_device(m);
+#endif
+    // Bridge notification channel — NOT device-gated (a device-off build still needs it).
     m.def("_emit_raw", [](const std::string &s) { bridge_emit(s); },
           "enqueue a JSON-RPC notification line to the active bridge connection");
-#endif
 }
 
 // ---------------------------------------------------------------------------
@@ -193,14 +190,13 @@ def _handle_request(s):
 _ps._handle_request = _handle_request
 )PY";
 
-#ifndef _WIN32
-// Outbound channel: all writes (responses + async notifications) serialize through
-// one writer thread draining a queue, so the app can PUSH notifications to the
-// connected client (bridge_emit), not just answer requests. Single connection.
+// Outbound channel: all writes (responses + async notifications) serialise through one
+// writer thread draining a queue, so the app can PUSH notifications to the connected client
+// (bridge_emit), not just answer requests. TCP loopback via Boost.Asio — ONE code path for
+// Linux/macOS/Windows (asio initialises Winsock itself). Single connection.
 static std::mutex               g_out_mtx;
 static std::condition_variable  g_out_cv;
 static std::deque<std::string>  g_outbox;
-static int                      g_conn_fd = -1;
 static bool                     g_conn_open = false;
 
 static void outbox_push(std::string line)
@@ -214,7 +210,7 @@ static void bridge_emit(const std::string &line)   // Python/main-thread callabl
     if (g_conn_open) outbox_push(line);
 }
 
-static void bridge_writer_loop()
+static void bridge_writer_loop(std::shared_ptr<boost::asio::ip::tcp::socket> sock)
 {
     for (;;) {
         std::string line;
@@ -226,41 +222,41 @@ static void bridge_writer_loop()
             g_outbox.pop_front();
         }
         line.push_back('\n');
-        if (g_conn_fd >= 0) {
-            ssize_t off = 0, len = (ssize_t) line.size();
-            while (off < len) {
-                ssize_t w = ::send(g_conn_fd, line.data() + off, (size_t)(len - off), MSG_NOSIGNAL);
-                if (w <= 0) break;
-                off += w;
-            }
-        }
+        boost::system::error_code ec;
+        boost::asio::write(*sock, boost::asio::buffer(line), ec);   // sole writer of the socket
+        // on error the peer is gone; keep draining until g_conn_open flips false
     }
 }
 
 static void bridge_serve(int port)
 {
-    int srv = ::socket(AF_INET, SOCK_STREAM, 0);
-    if (srv < 0) { std::perror("pyslic3r bridge: socket"); return; }
-    int opt = 1; ::setsockopt(srv, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
-    sockaddr_in addr{}; addr.sin_family = AF_INET;
-    addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK); addr.sin_port = htons((uint16_t) port);
-    if (::bind(srv, (sockaddr *) &addr, sizeof(addr)) < 0) { std::perror("pyslic3r bridge: bind"); ::close(srv); return; }
-    ::listen(srv, 4);
-    std::fprintf(stderr, "pyslic3r bridge: listening on 127.0.0.1:%d\n", port); std::fflush(stderr);
-    for (;;) {
-        int c = ::accept(srv, nullptr, nullptr);
-        if (c < 0) continue;
-        { std::lock_guard<std::mutex> lk(g_out_mtx); g_outbox.clear(); }
-        g_conn_fd = c; g_conn_open = true;
-        std::thread writer(bridge_writer_loop);
-        std::string buf; char tmp[8192];
+    namespace asio = boost::asio;
+    using asio::ip::tcp;
+    try {
+        asio::io_context io;
+        tcp::endpoint ep(asio::ip::make_address("127.0.0.1"), (unsigned short) port);
+        tcp::acceptor acceptor(io);
+        acceptor.open(ep.protocol());
+        acceptor.set_option(asio::socket_base::reuse_address(true));
+        acceptor.bind(ep);
+        acceptor.listen(4);
+        std::fprintf(stderr, "pyslic3r bridge: listening on 127.0.0.1:%d\n", port); std::fflush(stderr);
         for (;;) {
-            ssize_t n = ::recv(c, tmp, sizeof(tmp), 0);
-            if (n <= 0) break;
-            buf.append(tmp, (size_t) n);
-            size_t pos;
-            while ((pos = buf.find('\n')) != std::string::npos) {
-                std::string line = buf.substr(0, pos); buf.erase(0, pos + 1);
+            auto sock = std::make_shared<tcp::socket>(io);
+            boost::system::error_code ec;
+            acceptor.accept(*sock, ec);
+            if (ec) continue;
+            { std::lock_guard<std::mutex> lk(g_out_mtx); g_outbox.clear(); }
+            g_conn_open = true;
+            std::thread writer(bridge_writer_loop, sock);
+            asio::streambuf inbuf;
+            for (;;) {
+                boost::system::error_code rec;
+                asio::read_until(*sock, inbuf, '\n', rec);
+                if (rec) break;                       // peer closed / error
+                std::istream is(&inbuf);
+                std::string line;
+                std::getline(is, line);               // one request line (\n consumed)
                 if (line.empty()) continue;
                 std::string resp;
                 try {
@@ -273,19 +269,19 @@ static void bridge_serve(int port)
                     resp = std::string("{\"jsonrpc\":\"2.0\",\"id\":null,\"error\":{\"code\":-32001,\"message\":\"bridge: ")
                          + e.what() + "\"}}";
                 }
-                outbox_push(std::move(resp));   // response rides the writer thread too
+                outbox_push(std::move(resp));          // response rides the writer thread too
             }
+            g_conn_open = false;
+            g_out_cv.notify_all();
+            writer.join();
+            boost::system::error_code cec;
+            sock->shutdown(tcp::socket::shutdown_both, cec);
+            sock->close(cec);
         }
-        g_conn_open = false;
-        g_out_cv.notify_all();
-        writer.join();
-        g_conn_fd = -1;
-        ::close(c);
+    } catch (const std::exception &e) {
+        std::fprintf(stderr, "pyslic3r bridge: %s\n", e.what()); std::fflush(stderr);
     }
 }
-#else
-static void bridge_emit(const std::string &) {}   // Winsock port deferred
-#endif
 
 void maybe_start_bridge()
 {
@@ -293,9 +289,6 @@ void maybe_start_bridge()
     if (ps == nullptr || *ps == '\0') return;
     int port = std::atoi(ps);
     if (port <= 0) return;
-#ifdef _WIN32
-    std::fprintf(stderr, "pyslic3r bridge: not yet ported to Windows (Winsock)\n");
-#else
     {
         py::gil_scoped_acquire gil;
         py::object nsdict = py::module_::import("pyslic3r").attr("__dict__");
@@ -309,7 +302,6 @@ void maybe_start_bridge()
         }
     }
     std::thread(bridge_serve, port).detach();
-#endif
 }
 
 // ---------------------------------------------------------------------------
