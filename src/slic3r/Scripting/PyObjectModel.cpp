@@ -405,7 +405,7 @@ static const std::vector<SettingDef> &settings_defs()
         {"first_layer_height","initial_layer_print_height",'o',false,{}},
         {"wall_count","wall_loops",'i',false,{}},
         {"infill_density","sparse_infill_density",'p',false,{}},
-        {"infill_pattern","sparse_infill_pattern",'e',false,{{"grid","grid"},{"gyroid","gyroid"},{"honeycomb","honeycomb"},{"cubic","cubic"},{"concentric","concentric"},{"triangles","triangles"},{"lightning","lightning"}}},
+        {"infill_pattern","sparse_infill_pattern",'e',false,{{"grid","grid"},{"gyroid","gyroid"},{"honeycomb","honeycomb"},{"cubic","cubic"},{"concentric","concentric"},{"triangles","triangles"},{"tri-hexagon","tri-hexagon"},{"lightning","lightning"},{"crosshatch","crosshatch"},{"zigzag","zigzag"},{"crosszag","crosszag"},{"lockedzag","lockedzag"},{"2dlattice","2dlattice"}}},
         {"top_layers","top_shell_layers",'i',false,{}},
         {"bottom_layers","bottom_shell_layers",'i',false,{}},
         {"top_pattern","top_surface_pattern",'e',false,{{"monotonic","monotonic"},{"concentric","concentric"},{"aligned","alignedrectilinear"}}},
@@ -419,6 +419,12 @@ static const std::vector<SettingDef> &settings_defs()
         {"skirt_loops","skirt_loops",'i',false,{}},
         {"raft_layers","raft_layers",'i',false,{}},
         {"fuzzy_skin","fuzzy_skin",'e',false,{{"none","none"},{"external","external"},{"all","all"}}},
+        {"top_surface_density","top_surface_density",'p',false,{}},
+        {"bottom_surface_density","bottom_surface_density",'p',false,{}},
+        {"support_interface_pattern","support_interface_pattern",'e',false,{{"auto","auto"},{"rectilinear","rectilinear"},{"concentric","concentric"},{"rectilinear_interlaced","rectilinear_interlaced"},{"grid","grid"}}},
+        {"skirt_height","skirt_height",'i',false,{}},
+        {"scarf_seam","seam_slope_type",'e',false,{{"none","none"},{"external","external"},{"all","all"}}},
+        {"ironing","ironing_type",'e',false,{{"none","no ironing"},{"top","top"},{"topmost","topmost"},{"solid","solid"}}},
         {"spiral_vase","spiral_mode",'b',false,{}},
         {"wall_generator","wall_generator",'e',false,{{"classic","classic"},{"arachne","arachne"}}},
         {"elephant_foot","elefant_foot_compensation",'f',false,{}},
@@ -1803,6 +1809,15 @@ void register_object_model(py::module_ &m)
         .def("select", [](const PyPlate &p) {
             plater_or_throw("Plate.select")->get_partplate_list().select_plate(p.idx);
         })
+        .def("move", [](const PyPlate &p, double dx, double dy, double dz) {
+            auto *plater = plater_or_throw("Plate.move");
+            GUI::PartPlate *pl = plater->get_partplate_list().get_plate(p.idx);
+            if (pl == nullptr) throw std::runtime_error("plate gone");
+            GUI::Plater::TakeSnapshot snap(plater, "API: move plate");
+            pl->translate_all_instance(Vec3d(dx, dy, dz));
+            for (ModelObject *o : plater->model().objects) o->invalidate_bounding_box();
+            plater->update();
+        }, py::arg("dx"), py::arg("dy"), py::arg("dz") = 0.0)
         .def_property_readonly("config", [](const PyPlate &p) {
             return PyConfig{ConfigSource::Plate, p.idx};
         })
@@ -2022,6 +2037,12 @@ void register_object_model(py::module_ &m)
                 if (plater->get_ui_job_worker().is_idle()) break;
                 if (clock::now() - t0 > std::chrono::seconds(120)) break;
                 wxMilliSleep(40);
+            }
+            // Settle: let the ArrangeJob completion apply before returning (fixes
+            // slice(arrange=True) "not sliceable" on a fresh off-plate object).
+            for (int k = 0; k < 12; ++k) {
+                if (wxTheApp != nullptr) wxTheApp->Yield(true);
+                wxMilliSleep(20);
             }
         }, py::arg("wait") = false);
 
