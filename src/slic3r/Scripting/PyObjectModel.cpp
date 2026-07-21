@@ -2255,6 +2255,95 @@ void register_object_model(py::module_ &m)
             for (int i = 0; i < n; ++i) out.append(PyFilament{(size_t) i});
             return out;
         })
+        // ---- Multi-colour: flush / purge volumes (wipe tower) -------------
+        // How much filament (mm^3) to purge when switching between each pair of
+        // filaments, plus a global multiplier and where leftover purge goes.
+        // matrix + multiplier live in project_config; flush_into_* in print config.
+        // (UI-parity: the "Flushing volumes" dialog + print settings.)
+        .def("flush_matrix", [](const PyDocument &) {
+            auto *pb = GUI::wxGetApp().preset_bundle;
+            int n = (int) pb->filament_presets.size();
+            auto *opt = pb->project_config.option<ConfigOptionFloats>("flush_volumes_matrix");
+            if (opt == nullptr) throw std::runtime_error("no flush_volumes_matrix");
+            const auto &v = opt->values;
+            py::list rows;
+            for (int i = 0; i < n; ++i) {
+                py::list row;
+                for (int j = 0; j < n; ++j) {
+                    size_t idx = (size_t) i * n + j;
+                    row.append(idx < v.size() ? v[idx] : 0.0);
+                }
+                rows.append(row);
+            }
+            return rows;
+        })
+        .def("set_flush", [](const PyDocument &, int from_f, int to_f, double volume) {
+            auto *plater = plater_or_throw("Document.set_flush");
+            auto *pb = GUI::wxGetApp().preset_bundle;
+            int n = (int) pb->filament_presets.size();
+            if (from_f < 0 || from_f >= n || to_f < 0 || to_f >= n)
+                throw std::runtime_error("filament index out of range 0.." + std::to_string(n - 1));
+            auto *opt = pb->project_config.option<ConfigOptionFloats>("flush_volumes_matrix");
+            if (opt == nullptr) throw std::runtime_error("no flush_volumes_matrix");
+            if ((int) opt->values.size() < n * n) opt->values.resize((size_t) n * n, 0.0);
+            opt->values[(size_t) from_f * n + to_f] = volume;
+            plater->on_config_change(pb->full_config());
+            return volume;
+        }, py::arg("from_filament"), py::arg("to_filament"), py::arg("volume"))
+        .def("set_flush_matrix", [](const PyDocument &, py::list matrix) {
+            auto *plater = plater_or_throw("Document.set_flush_matrix");
+            auto *pb = GUI::wxGetApp().preset_bundle;
+            int n = (int) pb->filament_presets.size();
+            if ((int) matrix.size() != n)
+                throw std::runtime_error("matrix must be " + std::to_string(n) + "x" + std::to_string(n));
+            std::vector<double> flat((size_t) n * n, 0.0);
+            for (int i = 0; i < n; ++i) {
+                py::list row = matrix[i].cast<py::list>();
+                if ((int) row.size() != n) throw std::runtime_error("each row must have N entries");
+                for (int j = 0; j < n; ++j) flat[(size_t) i * n + j] = row[j].cast<double>();
+            }
+            auto *opt = pb->project_config.option<ConfigOptionFloats>("flush_volumes_matrix");
+            if (opt == nullptr) throw std::runtime_error("no flush_volumes_matrix");
+            opt->values = flat;
+            plater->on_config_change(pb->full_config());
+            return n;
+        }, py::arg("matrix"))
+        .def_property("flush_multiplier",
+            [](const PyDocument &) {
+                auto *pb = GUI::wxGetApp().preset_bundle;
+                auto *opt = pb->project_config.option<ConfigOptionFloats>("flush_multiplier");
+                return (opt && !opt->values.empty()) ? opt->values[0] : 1.0;
+            },
+            [](const PyDocument &, double m) {
+                auto *plater = plater_or_throw("Document.flush_multiplier");
+                auto *pb = GUI::wxGetApp().preset_bundle;
+                auto *opt = pb->project_config.option<ConfigOptionFloats>("flush_multiplier");
+                if (opt == nullptr) throw std::runtime_error("no flush_multiplier");
+                if (opt->values.empty()) opt->values.push_back(m); else opt->values[0] = m;
+                plater->on_config_change(pb->full_config());
+            })
+        .def("flush_into", [](const PyDocument &) {
+            auto *pb = GUI::wxGetApp().preset_bundle;
+            auto &pc = pb->prints.get_edited_preset().config;
+            auto getb = [&](const char *k) { auto *o = pc.option<ConfigOptionBool>(k); return o ? o->value : false; };
+            py::dict d;
+            d["infill"]  = getb("flush_into_infill");
+            d["support"] = getb("flush_into_support");
+            d["objects"] = getb("flush_into_objects");
+            return d;
+        })
+        .def("set_flush_into", [](const PyDocument &, py::object infill, py::object support, py::object objects) {
+            auto *plater = plater_or_throw("Document.set_flush_into");
+            auto *pb = GUI::wxGetApp().preset_bundle;
+            auto &pc = pb->prints.get_edited_preset().config;
+            auto setb = [&](const char *k, py::object val) {
+                if (!val.is_none()) if (auto *o = pc.option<ConfigOptionBool>(k)) o->value = val.cast<bool>();
+            };
+            setb("flush_into_infill", infill);
+            setb("flush_into_support", support);
+            setb("flush_into_objects", objects);
+            plater->on_config_change(pb->full_config());
+        }, py::arg("infill") = py::none(), py::arg("support") = py::none(), py::arg("objects") = py::none())
         .def_property_readonly("filament_count", [](const PyDocument &) {
             return (int) GUI::wxGetApp().preset_bundle->filament_presets.size();
         })
