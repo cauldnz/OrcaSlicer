@@ -1330,6 +1330,128 @@ void register_object_model(py::module_ &m)
             plater->changed_object(int(o.idx));
             return int(obj->volumes.size() - 1);   // index of the new volume
         }, py::arg("path"), py::arg("type") = "part")
+        // ---- Modifiers (UI-parity: right-click -> Add modifier / Load...) ----
+        // Add a primitive (box/cylinder/sphere/cone) OR an STL (path=) as a
+        // modifier / negative / support_enforcer / support_blocker volume,
+        // positioned to overlap the model. `settings` = per-volume overrides.
+        // `cover` sizes+places a box over a region: "zband:a-b" or "bbox"/"all".
+        // Coordinates are the object's local frame (same as bounding_box()).
+        .def("add_modifier", [](const PyObject &o, py::object shape, py::object path,
+                                const std::string &type_name, py::object size,
+                                py::object at, py::object cover, py::object settings,
+                                py::object name) {
+            main_thread("Object.add_modifier");
+            auto *plater = plater_or_throw("Object.add_modifier");
+            ModelObject *obj = object_at(o.idx, "Object.add_modifier");
+            const ModelVolumeType type = volume_type_from_str(type_name);
+            const BoundingBoxf3 rbb = obj->raw_bounding_box();
+            auto as_vec3 = [](py::object v, const char *w) -> Vec3d {
+                py::sequence q = v.cast<py::sequence>();
+                if (py::len(q) != 3) throw std::runtime_error(std::string(w) + " must be [x,y,z]");
+                return Vec3d(q[0].cast<double>(), q[1].cast<double>(), q[2].cast<double>());
+            };
+            TriangleMesh mesh;
+            Vec3d center = rbb.center();
+            Vec3d scale(1.0, 1.0, 1.0);
+
+            if (!path.is_none()) {
+                std::string pth = path.cast<std::string>();
+                if (!mesh.ReadSTLFile(pth.c_str()) || mesh.empty())
+                    throw std::runtime_error("add_modifier: could not read STL: " + pth);
+                BoundingBoxf3 mb = mesh.bounding_box();
+                Vec3d c = mb.center();
+                mesh.translate(-c.x(), -c.y(), -c.z());
+                if (!at.is_none()) center = as_vec3(at, "at");
+            } else if (!shape.is_none()) {
+                std::string sh = shape.cast<std::string>();
+                if      (sh == "box")      mesh = TriangleMesh(its_make_cube(1.0, 1.0, 1.0));
+                else if (sh == "cylinder") mesh = TriangleMesh(its_make_cylinder(1.0, 1.0));
+                else if (sh == "cone")     mesh = TriangleMesh(its_make_cone(1.0, 1.0));
+                else if (sh == "sphere")   mesh = TriangleMesh(its_make_sphere(1.0, 2.0 * PI / 360.0));
+                else throw std::runtime_error("add_modifier: shape must be box|cylinder|sphere|cone (or use path=)");
+                BoundingBoxf3 mb = mesh.bounding_box();
+                Vec3d c = mb.center();
+                mesh.translate(-c.x(), -c.y(), -c.z());
+                if (!cover.is_none()) {
+                    std::string cv = cover.cast<std::string>();
+                    if (cv.rfind("zband:", 0) == 0) {
+                        std::string rest = cv.substr(6);
+                        size_t dash = rest.find('-', 1);
+                        if (dash == std::string::npos) throw std::runtime_error("cover 'zband:a-b' malformed");
+                        double a = std::stod(rest.substr(0, dash));
+                        double b = std::stod(rest.substr(dash + 1));
+                        if (b <= a) throw std::runtime_error("cover zband:a-b needs b>a");
+                        scale  = Vec3d(rbb.size().x() * 1.1, rbb.size().y() * 1.1, b - a);
+                        center = Vec3d(rbb.center().x(), rbb.center().y(), rbb.min.z() + (a + b) / 2.0);
+                    } else if (cv == "bbox" || cv == "all") {
+                        scale  = rbb.size() * 1.05;
+                        center = rbb.center();
+                    } else {
+                        throw std::runtime_error("add_modifier: cover must be 'zband:a-b' or 'bbox'");
+                    }
+                } else {
+                    if (size.is_none())
+                        throw std::runtime_error("add_modifier: primitive needs size=[...] or cover=");
+                    if (sh == "sphere") {
+                        double r = py::isinstance<py::sequence>(size)
+                                     ? size.cast<py::sequence>()[0].cast<double>() : size.cast<double>();
+                        scale = Vec3d(r, r, r);
+                    } else if (sh == "box") {
+                        scale = as_vec3(size, "size");
+                    } else {
+                        py::sequence q = size.cast<py::sequence>();
+                        if (py::len(q) != 2) throw std::runtime_error("cylinder/cone size must be [radius, height]");
+                        scale = Vec3d(q[0].cast<double>(), q[0].cast<double>(), q[1].cast<double>());
+                    }
+                    if (!at.is_none()) center = as_vec3(at, "at");
+                }
+            } else {
+                throw std::runtime_error("add_modifier: give shape=box|cylinder|sphere|cone or path=<stl>");
+            }
+
+            GUI::Plater::TakeSnapshot snap(plater, std::string("API: add modifier"));
+            ModelVolume *v = obj->add_volume(std::move(mesh), type, false);
+            v->set_transformation(Geometry::translation_transform(center) * Geometry::scale_transform(scale));
+            v->name = name.is_none() ? (std::string(volume_type_str(type)) + std::string("-mod"))
+                                     : name.cast<std::string>();
+            if (!settings.is_none()) {
+                py::dict d = settings.cast<py::dict>();
+                ConfigSubstitutionContext ctx(ForwardCompatibilitySubstitutionRule::EnableSilent);
+                for (auto item : d) {
+                    std::string k   = py::str(item.first).cast<std::string>();
+                    std::string val = py::str(item.second).cast<std::string>();
+                    v->config.set_deserialize(k, val, ctx);
+                }
+            }
+            obj->invalidate_bounding_box();
+            plater->changed_object(int(o.idx));
+            return int(obj->volumes.size() - 1);
+        }, py::arg("shape") = py::none(), py::arg("path") = py::none(),
+           py::arg("type") = "modifier", py::arg("size") = py::none(),
+           py::arg("at") = py::none(), py::arg("cover") = py::none(),
+           py::arg("settings") = py::none(), py::arg("name") = py::none())
+        // Read back the object's parts/volumes with their modifier state.
+        .def("parts", [](const PyObject &o) {
+            main_thread("Object.parts");
+            ModelObject *obj = object_at(o.idx, "Object.parts");
+            py::list out;
+            for (size_t i = 0; i < obj->volumes.size(); ++i) {
+                const ModelVolume *v = obj->volumes[i];
+                py::dict d;
+                d["index"]       = int(i);
+                d["name"]        = v->name;
+                d["type"]        = std::string(volume_type_str(v->type()));
+                d["is_modifier"] = (v->type() == ModelVolumeType::PARAMETER_MODIFIER);
+                d["is_negative"] = (v->type() == ModelVolumeType::NEGATIVE_VOLUME);
+                py::dict st;
+                for (const std::string &k : v->config.keys())
+                    st[py::str(k)] = v->config.opt_serialize(k);
+                d["settings"]   = st;
+                d["triangles"]  = int(v->mesh().facets_count());
+                out.append(d);
+            }
+            return out;
+        })
         .def("simplify", [](const PyObject &o, double ratio) {
             main_thread("Object.simplify");
             if (ratio <= 0.0 || ratio >= 1.0)
