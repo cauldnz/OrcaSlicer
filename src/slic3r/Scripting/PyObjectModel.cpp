@@ -1245,6 +1245,54 @@ void register_object_model(py::module_ &m)
             if (!obj->instances.empty())
                 d["position"] = vec3(obj->instances.front()->get_offset());
             d["instances"] = obj->instances.size();
+            // ---- model -> world transform (read-back parity; task #30) -------
+            // Neither matrix alone is the model->world map: `rotate`/`scale` bake
+            // into the VOLUME transform while `translate`/arrange move the
+            // INSTANCE. So an instance-only read reports identity after a rotate,
+            // which is exactly the footgun that made anchor resolution unsafe.
+            // The composition is instance * primary-model-part volume — the same
+            // one the mesh-export and measure paths use.
+            const ModelVolume *pv = nullptr;
+            for (const ModelVolume *v : obj->volumes)
+                if (v->is_model_part()) { pv = v; break; }
+            const Transform3d inst_m = obj->instances.empty()
+                ? Transform3d::Identity() : obj->instances.front()->get_matrix();
+            const Transform3d vol_m = pv ? pv->get_matrix() : Transform3d::Identity();
+            const Transform3d world_m = inst_m * vol_m;
+
+            auto mat16 = [](const Transform3d &t) {
+                py::list rows;                      // row-major, 4 rows of 4
+                for (int r = 0; r < 4; ++r) {
+                    py::list row;
+                    for (int c = 0; c < 4; ++c) row.append(t.matrix()(r, c));
+                    rows.append(row);
+                }
+                return rows;
+            };
+            d["matrix"]          = mat16(world_m);
+            d["instance_matrix"] = mat16(inst_m);
+            d["volume_matrix"]   = mat16(vol_m);
+            d["has_model_part"]  = (pv != nullptr);
+
+            Geometry::Transformation wt(world_m);
+            const Vec3d rot = wt.get_rotation();                 // radians
+            d["rotation_rad"] = vec3(rot);
+            d["rotation"]     = vec3(Vec3d(Geometry::rad2deg(rot.x()),
+                                           Geometry::rad2deg(rot.y()),
+                                           Geometry::rad2deg(rot.z())));
+            d["scale"]        = vec3(wt.get_scaling_factor());
+            d["offset"]       = vec3(wt.get_offset());
+            d["mirror"]       = vec3(wt.get_mirror());
+
+            // Cheap predicate the intent layer needs: with no rotation and no
+            // mirror, a model-frame anchor maps to world by scale+offset alone,
+            // so an annotation can be realized without a full matrix solve.
+            const Vec3d mir = wt.get_mirror();
+            const bool unrotated = std::abs(rot.x()) < 1e-6 && std::abs(rot.y()) < 1e-6
+                                && std::abs(rot.z()) < 1e-6;
+            const bool unmirrored = mir.x() > 0.0 && mir.y() > 0.0 && mir.z() > 0.0;
+            d["is_axis_aligned"] = unrotated && unmirrored;
+
             return d;
         })
         // ---- geometry finish (UI-parity: drop-to-bed, scale-to-fit, rename) --
