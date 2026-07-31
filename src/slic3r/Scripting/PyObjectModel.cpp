@@ -1298,6 +1298,24 @@ void register_object_model(py::module_ &m)
         // ---- geometry finish (UI-parity: drop-to-bed, scale-to-fit, rename) --
         .def("split", [](const PyObject &o) {
             main_thread("Object.split");
+            // Precondition, because the GUI path cannot fail safely here. All three
+            // forks guard split with `if (!volume->is_splittable())` and then pop a
+            // wxMessageBox ("contains only one part and can not be split"). Headless
+            // nothing dismisses that modal, so the app wedges forever inside
+            // gtk_dialog_run — no error, no log, just a hang until the harness
+            // timeout (issue #93). Test the SAME predicate first and raise, so the
+            // caller gets an ordinary Python exception instead of a dead app.
+            {
+                const ModelObject *_so = object_at(o.idx, "Object.split");
+                bool _splittable = false;
+                for (const ModelVolume *_v : _so->volumes)
+                    if (_v->is_model_part() && _v->is_splittable()) { _splittable = true; break; }
+                if (!_splittable)
+                    throw std::runtime_error(
+                        "split: object has only one connected part and cannot be split "
+                        "(use obj.cut to divide it, or load a multi-part mesh)");
+            }
+
             _select_only(o.idx, "Object.split");
             plater_or_throw("Object.split")->split_object();
             return model_or_throw("Object.split").objects.size();
