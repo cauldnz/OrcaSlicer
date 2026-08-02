@@ -724,6 +724,73 @@ static TriangleMesh svg_to_mesh(const std::string &path, double depth_mm)
 
 // ---------------------------------------------------------------------------
 
+// ---------------------------------------------------------------------------
+// Get EVERY shipped vendor catalogue into the bundle, with a per-vendor report.
+//
+// Both available_printers() (enumerate) and install_printer() (select) need this,
+// and they used to carry separate copies of the loop. The copies drifted: one was
+// fixed to merge from a scratch bundle and the other kept resetting the live
+// bundle per vendor, so models enumerated fine and then could not be selected --
+// the visible preset list held only the last vendor loaded. One function now.
+//
+// Why a scratch bundle at all: LoadSystem reads the presets but reset()s the
+// bundle it is called on (PresetBundle.cpp:4611), so looping it over `pb` wipes
+// each vendor as the next arrives. LoadVendorOnly skips the reset but returns
+// before reading any preset (:4829) -- enumerable, unselectable. Loading into a
+// scratch and merging gets both, and is exactly what Orca's own
+// load_system_presets_from_json does (:2250).
+static std::vector<std::pair<std::string, std::string>>
+load_all_vendor_profiles(PresetBundle *pb)
+{
+    std::vector<std::pair<std::string, std::string>> report;
+    if (pb == nullptr) return report;
+    namespace fs = boost::filesystem;
+    fs::path prof = fs::path(Slic3r::resources_dir()) / "profiles";
+    if (!fs::exists(prof)) {
+        report.emplace_back("(profiles)", "missing: " + prof.string());
+        return report;
+    }
+    // RECORD every outcome. This used to be `catch (...) {}`, which is why #103
+    // could say the load failed but not why. Three distinct results, because they
+    // need three different fixes: ok / the exception text / "loaded but nothing
+    // grew" (a silent no-op, not a throw).
+    auto load_one = [&](const std::string &vn) {
+        const size_t vendors_before  = pb->vendors.size();
+        const size_t printers_before = pb->printers.size();
+        try {
+            auto scratch = std::make_unique<PresetBundle>();
+            scratch->load_vendor_configs_from_json(prof.string(), vn,
+                PresetBundle::LoadSystem,
+                ForwardCompatibilitySubstitutionRule::EnableSystemSilent,
+                pb);
+            pb->merge_presets(std::move(*scratch));
+            if (pb->vendors.size() == vendors_before &&
+                pb->printers.size() == printers_before)
+                report.emplace_back(vn, "no-op: loaded without throwing, but neither "
+                                        "vendors nor printers grew");
+            else
+                report.emplace_back(vn, "ok: vendors " + std::to_string(vendors_before) +
+                    " -> " + std::to_string(pb->vendors.size()) + ", printers " +
+                    std::to_string(printers_before) + " -> " +
+                    std::to_string(pb->printers.size()));
+        } catch (const std::exception &e) {
+            report.emplace_back(vn, std::string("exception: ") + e.what());
+        } catch (...) {
+            report.emplace_back(vn, "exception: (non-std)");
+        }
+    };
+    // OrcaFilamentLibrary first: the vendor profiles reference its filaments, so
+    // loading it later leaves dangling inherits.
+    load_one("OrcaFilamentLibrary");
+    for (auto &de : fs::directory_iterator(prof)) {
+        if (de.path().extension() == ".json") {
+            std::string vn = de.path().stem().string();
+            if (vn != "OrcaFilamentLibrary") load_one(vn);
+        }
+    }
+    return report;
+}
+
 static void delete_object_synced(GUI::Plater *plater, size_t obj_idx)
 {
     // delete_object_from_model updates only the Model (+ PartPlateList); the GUI
@@ -2600,45 +2667,7 @@ void register_object_model(py::module_ &m)
             auto *pb = app.preset_bundle;
             std::vector<std::pair<std::string, std::string>> _vendor_load_report;
             if (pb->vendors.size() < 5)   // only Custom/OrcaFilamentLibrary -> load all
-            {
-                namespace fs = boost::filesystem;
-                fs::path prof = fs::path(Slic3r::resources_dir()) / "profiles";
-                if (fs::exists(prof)) {
-                    // RECORD every outcome. This used to be `catch (...) {}`, which
-                    // is why #103 could say the load fails but not why. One run now
-                    // reports per-vendor: ok / the exception text / "loaded but the
-                    // vendor map did not grow" (a silent no-op, which is a different
-                    // failure from a throw and needs a different fix).
-                    auto load_one = [&](const std::string &vn) {
-                        const size_t before = pb->vendors.size();
-                        try {
-                            // LoadVendorOnly, NOT LoadSystem. LoadSystem makes
-                            // load_vendor_configs_from_json() reset() the whole
-                            // bundle on entry (PresetBundle.cpp:4611), so calling
-                            // it per vendor in a loop wipes every vendor loaded so
-                            // far -- which is exactly why this reported one model
-                            // out of 66 catalogues.
-                            pb->load_vendor_configs_from_json(prof.string(), vn,
-                                PresetBundle::LoadVendorOnly,
-                                ForwardCompatibilitySubstitutionRule::EnableSystemSilent);
-                            _vendor_load_report.emplace_back(
-                                vn, "ok: " + std::to_string(before) + " -> " +
-                                    std::to_string(pb->vendors.size()) + " vendors");
-                        } catch (const std::exception &e) {
-                            _vendor_load_report.emplace_back(vn, std::string("exception: ") + e.what());
-                        } catch (...) {
-                            _vendor_load_report.emplace_back(vn, "exception: (non-std)");
-                        }
-                    };
-                    load_one("OrcaFilamentLibrary");
-                    for (auto &de : fs::directory_iterator(prof)) {
-                        if (de.path().extension() == ".json") {
-                            std::string vn = de.path().stem().string();
-                            if (vn != "OrcaFilamentLibrary") load_one(vn);
-                        }
-                    }
-                }
-            }
+                _vendor_load_report = load_all_vendor_profiles(pb);
             // Stash the report where a second call can read it — keeping
             // available_printers' return shape identical across the three forks.
             {
@@ -2677,25 +2706,10 @@ void register_object_model(py::module_ &m)
             if (pb == nullptr || ac == nullptr) throw std::runtime_error("no preset bundle / app config");
             const Preset *mp = pb->printers.find_preset(name, false);
             if (mp == nullptr) {   // fresh datadir: load the full system vendor set, retry
-            {
-                namespace fs = boost::filesystem;
-                fs::path prof = fs::path(Slic3r::resources_dir()) / "profiles";
-                if (fs::exists(prof)) {
-                    auto load_one = [&](const std::string &vn) {
-                        try { pb->load_vendor_configs_from_json(prof.string(), vn,
-                                PresetBundle::LoadSystem,
-                                ForwardCompatibilitySubstitutionRule::EnableSystemSilent); }
-                        catch (...) {}
-                    };
-                    load_one("OrcaFilamentLibrary");
-                    for (auto &de : fs::directory_iterator(prof)) {
-                        if (de.path().extension() == ".json") {
-                            std::string vn = de.path().stem().string();
-                            if (vn != "OrcaFilamentLibrary") load_one(vn);
-                        }
-                    }
-                }
-            }
+                // Same loader available_printers() uses. It used to be a second copy
+                // that reset the bundle per vendor, so enumeration saw 384 models and
+                // this retry then found only the last vendor's presets.
+                load_all_vendor_profiles(pb);
                 mp = pb->printers.find_preset(name, false);
             }
             if (mp == nullptr) throw std::runtime_error("no such printer preset: " + name + " (see available_printers())");
@@ -2719,8 +2733,20 @@ void register_object_model(py::module_ &m)
                 for (const auto &f : fils) sec[f] = "true";
                 ac->set_section(AppConfig::SECTION_FILAMENTS, sec);
             }
-            pb->load_presets(*ac, ForwardCompatibilitySubstitutionRule::EnableSystemSilent);
+            // Do NOT call load_presets() here. It re-reads data_dir()/system
+            // (load_system_presets_from_json, PresetBundle.cpp:2194), which on a
+            // headless datadir is empty -- so it replaced the ~1000 presets just
+            // merged from resources/profiles with the single default, and
+            // apply_preset then could not find the printer install_printer had
+            // reported installing. Seeding datadir/system does not fix it; the
+            // merged catalogue is the source of truth on this fork.
+            //
+            // What the reload was wanted for is narrower than the reload:
+            //   * apply the AppConfig variant we just set  -> load_installed_printers
+            //   * settle compatibility for the new printer -> update_compatible
+            pb->load_installed_printers(*ac);
             pb->printers.select_preset_by_name(name, true);
+            pb->update_compatible(PresetSelectCompatibleType::Always);
             int vis = 0;
             for (const Preset &pr : pb->printers.get_presets()) if (pr.is_visible) ++vis;
             py::dict out;
