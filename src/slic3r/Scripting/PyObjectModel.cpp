@@ -1306,14 +1306,37 @@ void register_object_model(py::module_ &m)
             // timeout (issue #93). Test the SAME predicate first and raise, so the
             // caller gets an ordinary Python exception instead of a dead app.
             {
+                // MIRROR THE FORK'S OWN ALGORITHM (Model.cpp ModelObject::split).
+                // is_multi_volume_object counts ALL volumes, modifiers included:
+                //   multi-volume  -> shell splitting is SKIPPED; one object per
+                //                    MODEL_PART, so >= 2 model parts are needed.
+                //   single volume -> that mesh is shell-split, so >= 2 shells.
+                // A single model part plus a modifier therefore yields ONE object
+                // however splittable the part's mesh is -- the case a naive
+                // is_splittable() check waves through and into the modal.
                 const ModelObject *_so = object_at(o.idx, "Object.split");
-                bool _splittable = false;
+                int _parts = 0;
+                const ModelVolume *_only_part = nullptr;
                 for (const ModelVolume *_v : _so->volumes)
-                    if (_v->is_model_part() && _v->is_splittable()) { _splittable = true; break; }
+                    if (_v->is_model_part()) { ++_parts; if (_parts == 1) _only_part = _v; }
+                const bool _multi_volume = _so->volumes.size() > 1;
+                bool _splittable = false;
+                const char *_why = "";
+                if (_parts == 0) {
+                    _why = "object has no model-part volume to split";
+                } else if (_multi_volume) {
+                    _splittable = (_parts >= 2);
+                    _why = "object has extra volumes (modifier/support/negative), so the "
+                           "slicer splits by VOLUME and not by mesh shell; it needs at "
+                           "least two model parts";
+                } else {
+                    _splittable = _only_part && _only_part->is_splittable();
+                    _why = "the single model part is one connected shell";
+                }
                 if (!_splittable)
                     throw std::runtime_error(
-                        "split: object has only one connected part and cannot be split "
-                        "(use obj.cut to divide it, or load a multi-part mesh)");
+                        std::string("split: nothing to split -- ") + _why +
+                        ". Use obj.cut to divide it, or load a multi-part mesh.");
             }
 
             _select_only(o.idx, "Object.split");
