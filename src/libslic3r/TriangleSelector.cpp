@@ -1004,6 +1004,24 @@ bool TriangleSelector::select_triangle_recursive(int facet_idx, const Vec3i32 &n
     return true;
 }
 
+int TriangleSelector::remap_states(const std::map<int, int> &mapping)
+{
+    int changed = 0;
+    for (Triangle &tr : m_triangles) {
+        // get_state() asserts !is_split(), and state only means anything on a leaf
+        // anyway — an interior node's value is not paint.
+        if (!tr.valid() || tr.is_split())
+            continue;
+        const int from = int(tr.get_state());
+        auto it = mapping.find(from);
+        if (it != mapping.end() && it->second != from) {
+            tr.set_state(static_cast<EnforcerBlockerType>(it->second));
+            ++changed;
+        }
+    }
+    return changed;
+}
+
 void TriangleSelector::set_facet(int facet_idx, EnforcerBlockerType state)
 {
     assert(facet_idx < m_orig_size_indices);

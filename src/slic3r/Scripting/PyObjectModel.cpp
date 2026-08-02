@@ -1060,6 +1060,78 @@ void register_object_model(py::module_ &m)
             if (z_max <= z_min) throw std::runtime_error("paint_mmu_band: z_max must be > z_min");
             return mmu_paint_band(v, z_min, z_max, extruder);
         }, py::arg("z_min"), py::arg("z_max"), py::arg("extruder"))
+        // ---- colour IMPORT: what does an already-painted model expect? -------
+        // A downloaded multi-colour 3MF carries paint keyed to the slots ITS author
+        // used. is_mm_painted only says "yes, painted"; this says which extruders
+        // and how much of the mesh each covers — enough to decide whether this
+        // printer can print the model at all.
+        //
+        // Implemented via FacetsAnnotation::get_facets(), which this tree exposes
+        // publicly (as PrusaSlicer does). The Bambu port walks TriangleSelector
+        // leaves instead, because get_triangles() had to be added there. So the
+        // absolute facet numbers can differ between forks for the same paint; both
+        // are internally consistent, and the tests assert invariants -- sums,
+        // preservation across a remap -- not absolute counts.
+        .def("paint_extruders", [](const PyVolume &v) {
+            main_thread("Volume.paint_extruders");
+            ModelVolume *vol = volume_at(v, "Volume.paint_extruders");
+            py::dict out;
+            py::list rows;
+            if (vol->mmu_segmentation_facets.get_data().triangles_to_split.empty()) {
+                out["painted"] = false;
+                out["extruders"] = rows;
+                out["total_facets"] = 0;
+                return out;
+            }
+            int total = 0;
+            std::map<int, int> counts;
+            for (int st = 0; st <= int(EnforcerBlockerType::ExtruderMax); ++st) {
+                indexed_triangle_set its = vol->mmu_segmentation_facets.get_facets(
+                    *vol, static_cast<EnforcerBlockerType>(st));
+                const int n = int(its.indices.size());
+                if (n > 0) { counts[st] = n; total += n; }
+            }
+            for (const auto &kv : counts) {
+                // state 0 is NONE (unpainted); reported as its own bucket rather
+                // than folded into a colour, so a partially-painted model is
+                // visible as one instead of looking like an extra extruder.
+                py::dict d;
+                d["extruder"] = kv.first;          // 1-based, 0 == unpainted
+                d["facets"]   = kv.second;
+                d["fraction"] = total ? double(kv.second) / double(total) : 0.0;
+                rows.append(d);
+            }
+            out["painted"]      = true;
+            out["extruders"]    = rows;
+            out["total_facets"] = total;
+            return out;
+        })
+        // ---- region -> extruder mapping --------------------------------------
+        // Move painted regions onto different filament slots. LOSSLESS: rewrites
+        // state on the selector's own leaves, so an author's sub-facet paint
+        // survives. Going through set_facet() would undivide and quietly coarsen
+        // it -- which is why TriangleSelector::remap_states is added here rather
+        // than composing the public API (PrusaSlicer ships remap_states upstream;
+        // this tree, like BambuStudio, does not).
+        .def("remap_paint_extruders", [](const PyVolume &v, const std::map<int, int> &mapping) {
+            main_thread("Volume.remap_paint_extruders");
+            ModelVolume *vol = volume_at(v, "Volume.remap_paint_extruders");
+            if (vol->mmu_segmentation_facets.get_data().triangles_to_split.empty())
+                throw std::runtime_error("remap_paint_extruders: volume has no MMU paint");
+            const int emax = int(EnforcerBlockerType::ExtruderMax);
+            for (const auto &kv : mapping) {
+                if (kv.first < 0 || kv.first > emax || kv.second < 0 || kv.second > emax)
+                    throw std::runtime_error(
+                        "remap_paint_extruders: extruder ids are 1.." + std::to_string(emax) +
+                        " (0 = unpainted); got " + std::to_string(kv.first) + "->" +
+                        std::to_string(kv.second));
+            }
+            TriangleSelector sel(vol->mesh());
+            sel.deserialize(vol->mmu_segmentation_facets.get_data(), false);
+            const int changed = sel.remap_states(mapping);
+            vol->mmu_segmentation_facets.set(sel);
+            return changed;
+        }, py::arg("mapping"))
         .def("clear_mmu_paint", [](const PyVolume &v) {
             main_thread("Volume.clear_mmu_paint");
             volume_at(v, "Volume.clear_mmu_paint")->mmu_segmentation_facets.reset();
