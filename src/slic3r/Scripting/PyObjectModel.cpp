@@ -2598,16 +2598,37 @@ void register_object_model(py::module_ &m)
             main_thread("app.available_printers");
             auto &app = GUI::wxGetApp();
             auto *pb = app.preset_bundle;
+            std::vector<std::pair<std::string, std::string>> _vendor_load_report;
             if (pb->vendors.size() < 5)   // only Custom/OrcaFilamentLibrary -> load all
             {
                 namespace fs = boost::filesystem;
                 fs::path prof = fs::path(Slic3r::resources_dir()) / "profiles";
                 if (fs::exists(prof)) {
+                    // RECORD every outcome. This used to be `catch (...) {}`, which
+                    // is why #103 could say the load fails but not why. One run now
+                    // reports per-vendor: ok / the exception text / "loaded but the
+                    // vendor map did not grow" (a silent no-op, which is a different
+                    // failure from a throw and needs a different fix).
                     auto load_one = [&](const std::string &vn) {
-                        try { pb->load_vendor_configs_from_json(prof.string(), vn,
-                                PresetBundle::LoadSystem,
-                                ForwardCompatibilitySubstitutionRule::EnableSystemSilent); }
-                        catch (...) {}
+                        const size_t before = pb->vendors.size();
+                        try {
+                            // LoadVendorOnly, NOT LoadSystem. LoadSystem makes
+                            // load_vendor_configs_from_json() reset() the whole
+                            // bundle on entry (PresetBundle.cpp:4611), so calling
+                            // it per vendor in a loop wipes every vendor loaded so
+                            // far -- which is exactly why this reported one model
+                            // out of 66 catalogues.
+                            pb->load_vendor_configs_from_json(prof.string(), vn,
+                                PresetBundle::LoadVendorOnly,
+                                ForwardCompatibilitySubstitutionRule::EnableSystemSilent);
+                            _vendor_load_report.emplace_back(
+                                vn, "ok: " + std::to_string(before) + " -> " +
+                                    std::to_string(pb->vendors.size()) + " vendors");
+                        } catch (const std::exception &e) {
+                            _vendor_load_report.emplace_back(vn, std::string("exception: ") + e.what());
+                        } catch (...) {
+                            _vendor_load_report.emplace_back(vn, "exception: (non-std)");
+                        }
                     };
                     load_one("OrcaFilamentLibrary");
                     for (auto &de : fs::directory_iterator(prof)) {
@@ -2617,6 +2638,18 @@ void register_object_model(py::module_ &m)
                         }
                     }
                 }
+            }
+            // Stash the report where a second call can read it — keeping
+            // available_printers' return shape identical across the three forks.
+            {
+                py::list rep;
+                for (const auto &kv : _vendor_load_report) {
+                    py::dict d;
+                    d["vendor"] = kv.first;
+                    d["result"] = kv.second;
+                    rep.append(d);
+                }
+                py::module_::import("pyslic3r").attr("_vendor_load_report") = rep;
             }
             py::list out;
             for (const auto &vp : pb->vendors) {
