@@ -2772,6 +2772,15 @@ void register_object_model(py::module_ &m)
             auto &list = plater->get_partplate_list();
             GUI::PartPlate *plate = list.get_plate(list.get_curr_plate_index());
             if (plate == nullptr) throw std::runtime_error("no current plate");
+            // #106: a FILE existing is not a RESULT being valid. A failed re-slice
+            // leaves the previous slice's file on disk, and copying it hands the
+            // caller the wrong G-code with no error anywhere — the worst shape a bug
+            // can take here. Ask the same question the GUI's export path asks.
+            if (!plate->is_slice_result_valid())
+                throw std::runtime_error(
+                    "the plate's slice result is not valid — the last slice failed or "
+                    "the model changed since; re-slice first. Refusing to hand back a "
+                    "stale result (#106)");
             fs::path src(plate->get_tmp_gcode_path());
             if (src.empty() || !fs::exists(src))
                 throw std::runtime_error("no sliced G-code yet; call slice().wait() first");
@@ -2788,6 +2797,16 @@ void register_object_model(py::module_ &m)
             namespace fs = boost::filesystem;
             auto *plater = plater_or_throw("Document.export_gcode_3mf");
             auto &list = plater->get_partplate_list();
+            {
+                GUI::PartPlate *cur = list.get_plate(list.get_curr_plate_index());
+                // #106, same hole as save_gcode: export_gcode_3mf packages the
+                // plate's last result; a failed re-slice must not export the
+                // previous one. (export_gcode_3mf: stale guard)
+                if (cur == nullptr || !cur->is_slice_result_valid())
+                    throw std::runtime_error(
+                        "the plate's slice result is not valid — the last slice "
+                        "failed or the model changed since; re-slice first (#106)");
+            }
             int idx = list.get_curr_plate_index();
             GUI::PartPlate *plate = list.get_plate(idx);
             if (plate == nullptr) throw std::runtime_error("no current plate");
