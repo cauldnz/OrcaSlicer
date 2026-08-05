@@ -606,6 +606,41 @@ void Tab::create_preset_tab()
     m_completed = true;
 }
 
+// nozzle_volume_type is a PROJECT config vector and is NOT resized when a printer
+// with a different extruder count is selected, so it can be SHORTER than
+// get_printer_extruder_count(). Several sites loop to the extruder count while
+// indexing the vector: that asserts in a Debug build and reads out of bounds in a
+// Release one, where the garbage integer is handed straight to NozzleVolumeType()
+// and shown as a nozzle label.
+//
+// Reproduced by selecting "M3D Enabler D8500 MM" (2 extruders) after a
+// single-extruder printer and clearing the plate -- the ObjectList rebuild walks
+// Tab::update_dirty -> update_changed_ui -> generate_extruder_options.
+//
+// nvtStandard as the fallback matches Tab::get_actual_nozzle_volume_type, which
+// already answers that for an out-of-range extruder; a second convention here would
+// mean the same unknown extruder read differently depending on which path asked.
+// Companion to nozzle_volume_at, for the same reason: per-extruder config vectors are
+// not all resized together when the selected printer changes its extruder count, so
+// any of them can be shorter than get_printer_extruder_count(). Reproduced on
+// "Raise3D Pro3 0.4 nozzle (Dual)" at Tab.cpp:1117 with a one-entry extruder_type.
+//
+// etDirectDrive (0) as the fallback is the same "assume the ordinary case" this file
+// already applies for an unknown nozzle volume.
+static ExtruderType extruder_type_at(const ConfigOptionEnumsGeneric *et, int i)
+{
+    if (et == nullptr || i < 0 || i >= int(et->values.size()))
+        return ExtruderType(0);
+    return ExtruderType(et->values[i]);
+}
+
+static NozzleVolumeType nozzle_volume_at(const ConfigOptionEnumsGeneric *nv, int i)
+{
+    if (nv == nullptr || i < 0 || i >= int(nv->values.size()))
+        return NozzleVolumeType::nvtStandard;
+    return NozzleVolumeType(nv->values[i]);
+}
+
 void Tab::parse_extruder_selection(int selection, int &extruder_id, NozzleVolumeType &nozzle_type)
 {
     auto nozzle_volumes = m_preset_bundle->project_config.option<ConfigOptionEnumsGeneric>("nozzle_volume_type");
@@ -614,7 +649,7 @@ void Tab::parse_extruder_selection(int selection, int &extruder_id, NozzleVolume
     int current_index = 0;
 
     for (int i = 0; i < extruder_nums; ++i) {
-        NozzleVolumeType volume_type = NozzleVolumeType(nozzle_volumes->values[i]);
+        NozzleVolumeType volume_type = nozzle_volume_at(nozzle_volumes, i);
 
         // TODO: Orca: Support hybrid
         //if (volume_type == NozzleVolumeType::nvtHybrid) {
@@ -652,7 +687,7 @@ int Tab::calculate_selection_index_for_extruder(int extruder_id, NozzleVolumeTyp
     for (int i = 0; i < extruder_nums; ++i) {
         if (i == extruder_id) {
             // TODO: Orca: Support hybrid
-            NozzleVolumeType volume_type = NozzleVolumeType(nozzle_volumes->values[i]);
+            NozzleVolumeType volume_type = nozzle_volume_at(nozzle_volumes, i);
             /*if (volume_type == NozzleVolumeType::nvtHybrid) {
                 return nozzle_type == NozzleVolumeType::nvtHighFlow ? index + 1 : index;
             } else*/ {
@@ -660,7 +695,7 @@ int Tab::calculate_selection_index_for_extruder(int extruder_id, NozzleVolumeTyp
             }
         }
 
-        NozzleVolumeType volume_type = NozzleVolumeType(nozzle_volumes->values[i]);
+        NozzleVolumeType volume_type = nozzle_volume_at(nozzle_volumes, i);
         index += /*(volume_type == NozzleVolumeType::nvtHybrid) ? 2 :*/ 1;
     }
 
@@ -1093,7 +1128,7 @@ void Tab::update_all_extruder_options_status()
             int config_index = m_config->get_index_for_extruder(
                 extruder_id + 1,
                 variant_keys.first,
-                ExtruderType(extruders->values[extruder_id]),
+                extruder_type_at(extruders, extruder_id),
                 nozzle_type,
                 variant_keys.second
             );
@@ -1194,7 +1229,7 @@ void Tab::check_extruder_options_status(int index, bool &sys_extruder, bool &mod
         config_index = m_config->get_index_for_extruder(
             extruder_id + 1,
             variant_keys.first,
-            ExtruderType(extruders->values[extruder_id]),
+            extruder_type_at(extruders, extruder_id),
             nozzle_type,
             variant_keys.second
         );
@@ -5801,7 +5836,7 @@ void TabPrinter::toggle_options()
         auto get_index_for_extruder =
             [this, &extruders, &nozzle_volumes](int extruder_id, int stride = 1) {
         return m_config->get_index_for_extruder(extruder_id + 1, "printer_extruder_id",
-            ExtruderType(extruders->values[extruder_id]), get_actual_nozzle_volume_type(extruder_id), "printer_extruder_variant", stride);
+            extruder_type_at(extruders, extruder_id), get_actual_nozzle_volume_type(extruder_id), "printer_extruder_variant", stride);
     };
 
     //BBS: whether the preset is Bambu Lab printer
@@ -7818,7 +7853,7 @@ std::vector<wxString> Tab::generate_extruder_options()
         int ext_id = (i == 0) ? DEPUTY_EXTRUDER_ID : MAIN_EXTRUDER_ID;
         wxString extruder_name = _L(DevPrinterConfigUtil::get_toolhead_display_name(
             pt, ext_id, ToolHeadComponent::Nozzle, ToolHeadNameCase::TitleCase, true));
-        NozzleVolumeType volume_type = NozzleVolumeType(nozzle_volumes->values[i]);
+        NozzleVolumeType volume_type = nozzle_volume_at(nozzle_volumes, i);
         
         // TODO: Orca: Support hybrid
         /*if (volume_type == NozzleVolumeType::nvtHybrid) {
@@ -7840,7 +7875,9 @@ NozzleVolumeType Tab::get_actual_nozzle_volume_type(int extruder_id)
         if (extruder_id < 0)
             return NozzleVolumeType::nvtStandard;
 
-        return NozzleVolumeType(nozzle_volumes->values[extruder_id]);
+        // Bounds-checked: extruder_count == 1 does not guarantee the vector has an
+        // entry at extruder_id, and the caller's id comes from the UI, not from it.
+        return nozzle_volume_at(nozzle_volumes, extruder_id);
     }
 
     if (extruder_id < 0 || extruder_id >= extruder_count)
@@ -7937,7 +7974,7 @@ void Tab::switch_excluder(int extruder_id, bool reload)
     auto get_index_for_extruder =
             [this, &extruders, &nozzle_volumes, variant_keys = extruder_variant_keys[m_type >= Preset::TYPE_COUNT ? Preset::TYPE_PRINT : m_type]](int extruder_id, int stride = 1) {
         return m_config->get_index_for_extruder(extruder_id + 1, variant_keys.first,
-            ExtruderType(extruders->values[extruder_id]), get_actual_nozzle_volume_type(extruder_id), variant_keys.second, stride);
+            extruder_type_at(extruders, extruder_id), get_actual_nozzle_volume_type(extruder_id), variant_keys.second, stride);
     };
     auto index = m_variant_combo ? extruder_id : get_index_for_extruder(extruder_id == -1 ? 0 : extruder_id);
     if (index < 0)
@@ -7994,7 +8031,7 @@ void Tab::sync_excluder()
     auto get_index_for_extruder =
             [this, &extruders, &nozzle_volumes, variant_keys = extruder_variant_keys[m_type >= Preset::TYPE_COUNT ? Preset::TYPE_PRINT : m_type]](int extruder_id, NozzleVolumeType nozzle_type) {
         return m_config->get_index_for_extruder(extruder_id + 1, variant_keys.first,
-            ExtruderType(extruders->values[extruder_id]), nozzle_type, variant_keys.second);
+            extruder_type_at(extruders, extruder_id), nozzle_type, variant_keys.second);
     };
     int active_index = get_current_active_extruder();
     auto active_nozzle = get_actual_nozzle_volume_type(active_index);

@@ -501,7 +501,14 @@ private:
     //BBS: add json related logic
     std::pair<PresetsConfigSubstitutions, std::string> load_system_presets_from_json(ForwardCompatibilitySubstitutionRule compatibility_rule);
     // Merge one vendor's presets with the other vendor's presets, report duplicates.
+public:
+    // merge_presets is public so the pyslic3r binding can do what
+    // load_system_presets_from_json already does internally (PresetBundle.cpp:2250):
+    // load each vendor into a scratch bundle with LoadSystem, then merge. LoadSystem
+    // resets the bundle it is called on, so merging from a scratch bundle is the only
+    // way to accumulate vendors without each one wiping the last.
     std::vector<std::string>    merge_presets(PresetBundle &&other);
+private:
     // Update the multicolor information for filaments.
     void update_filament_multi_color();
     // Update renamed_from and alias maps of system profiles.

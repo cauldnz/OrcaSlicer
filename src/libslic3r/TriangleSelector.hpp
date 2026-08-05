@@ -340,6 +340,13 @@ public:
     void get_facets(std::vector<indexed_triangle_set>& facets_per_type) const;
 
     // Set facet of the mesh to a given state. Only works for original triangles.
+    // Rewrite leaf STATE in place, leaving subdivision untouched. Used by the
+    // pyslic3r colour-import remap: a downloaded 3MF is painted against whatever
+    // slots its author used, and moving it onto different ones must not coarsen
+    // the paint. Going through set_facet() would, because that undivides.
+    // Returns how many leaves actually changed.
+    int remap_states(const std::map<int, int> &mapping);
+
     void set_facet(int facet_idx, EnforcerBlockerType state);
 
     // Clear everything and make the tree empty.

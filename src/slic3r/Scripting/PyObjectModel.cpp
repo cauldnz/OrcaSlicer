@@ -724,6 +724,73 @@ static TriangleMesh svg_to_mesh(const std::string &path, double depth_mm)
 
 // ---------------------------------------------------------------------------
 
+// ---------------------------------------------------------------------------
+// Get EVERY shipped vendor catalogue into the bundle, with a per-vendor report.
+//
+// Both available_printers() (enumerate) and install_printer() (select) need this,
+// and they used to carry separate copies of the loop. The copies drifted: one was
+// fixed to merge from a scratch bundle and the other kept resetting the live
+// bundle per vendor, so models enumerated fine and then could not be selected --
+// the visible preset list held only the last vendor loaded. One function now.
+//
+// Why a scratch bundle at all: LoadSystem reads the presets but reset()s the
+// bundle it is called on (PresetBundle.cpp:4611), so looping it over `pb` wipes
+// each vendor as the next arrives. LoadVendorOnly skips the reset but returns
+// before reading any preset (:4829) -- enumerable, unselectable. Loading into a
+// scratch and merging gets both, and is exactly what Orca's own
+// load_system_presets_from_json does (:2250).
+static std::vector<std::pair<std::string, std::string>>
+load_all_vendor_profiles(PresetBundle *pb)
+{
+    std::vector<std::pair<std::string, std::string>> report;
+    if (pb == nullptr) return report;
+    namespace fs = boost::filesystem;
+    fs::path prof = fs::path(Slic3r::resources_dir()) / "profiles";
+    if (!fs::exists(prof)) {
+        report.emplace_back("(profiles)", "missing: " + prof.string());
+        return report;
+    }
+    // RECORD every outcome. This used to be `catch (...) {}`, which is why #103
+    // could say the load failed but not why. Three distinct results, because they
+    // need three different fixes: ok / the exception text / "loaded but nothing
+    // grew" (a silent no-op, not a throw).
+    auto load_one = [&](const std::string &vn) {
+        const size_t vendors_before  = pb->vendors.size();
+        const size_t printers_before = pb->printers.size();
+        try {
+            auto scratch = std::make_unique<PresetBundle>();
+            scratch->load_vendor_configs_from_json(prof.string(), vn,
+                PresetBundle::LoadSystem,
+                ForwardCompatibilitySubstitutionRule::EnableSystemSilent,
+                pb);
+            pb->merge_presets(std::move(*scratch));
+            if (pb->vendors.size() == vendors_before &&
+                pb->printers.size() == printers_before)
+                report.emplace_back(vn, "no-op: loaded without throwing, but neither "
+                                        "vendors nor printers grew");
+            else
+                report.emplace_back(vn, "ok: vendors " + std::to_string(vendors_before) +
+                    " -> " + std::to_string(pb->vendors.size()) + ", printers " +
+                    std::to_string(printers_before) + " -> " +
+                    std::to_string(pb->printers.size()));
+        } catch (const std::exception &e) {
+            report.emplace_back(vn, std::string("exception: ") + e.what());
+        } catch (...) {
+            report.emplace_back(vn, "exception: (non-std)");
+        }
+    };
+    // OrcaFilamentLibrary first: the vendor profiles reference its filaments, so
+    // loading it later leaves dangling inherits.
+    load_one("OrcaFilamentLibrary");
+    for (auto &de : fs::directory_iterator(prof)) {
+        if (de.path().extension() == ".json") {
+            std::string vn = de.path().stem().string();
+            if (vn != "OrcaFilamentLibrary") load_one(vn);
+        }
+    }
+    return report;
+}
+
 static void delete_object_synced(GUI::Plater *plater, size_t obj_idx)
 {
     // delete_object_from_model updates only the Model (+ PartPlateList); the GUI
@@ -993,6 +1060,78 @@ void register_object_model(py::module_ &m)
             if (z_max <= z_min) throw std::runtime_error("paint_mmu_band: z_max must be > z_min");
             return mmu_paint_band(v, z_min, z_max, extruder);
         }, py::arg("z_min"), py::arg("z_max"), py::arg("extruder"))
+        // ---- colour IMPORT: what does an already-painted model expect? -------
+        // A downloaded multi-colour 3MF carries paint keyed to the slots ITS author
+        // used. is_mm_painted only says "yes, painted"; this says which extruders
+        // and how much of the mesh each covers — enough to decide whether this
+        // printer can print the model at all.
+        //
+        // Implemented via FacetsAnnotation::get_facets(), which this tree exposes
+        // publicly (as PrusaSlicer does). The Bambu port walks TriangleSelector
+        // leaves instead, because get_triangles() had to be added there. So the
+        // absolute facet numbers can differ between forks for the same paint; both
+        // are internally consistent, and the tests assert invariants -- sums,
+        // preservation across a remap -- not absolute counts.
+        .def("paint_extruders", [](const PyVolume &v) {
+            main_thread("Volume.paint_extruders");
+            ModelVolume *vol = volume_at(v, "Volume.paint_extruders");
+            py::dict out;
+            py::list rows;
+            if (vol->mmu_segmentation_facets.get_data().triangles_to_split.empty()) {
+                out["painted"] = false;
+                out["extruders"] = rows;
+                out["total_facets"] = 0;
+                return out;
+            }
+            int total = 0;
+            std::map<int, int> counts;
+            for (int st = 0; st <= int(EnforcerBlockerType::ExtruderMax); ++st) {
+                indexed_triangle_set its = vol->mmu_segmentation_facets.get_facets(
+                    *vol, static_cast<EnforcerBlockerType>(st));
+                const int n = int(its.indices.size());
+                if (n > 0) { counts[st] = n; total += n; }
+            }
+            for (const auto &kv : counts) {
+                // state 0 is NONE (unpainted); reported as its own bucket rather
+                // than folded into a colour, so a partially-painted model is
+                // visible as one instead of looking like an extra extruder.
+                py::dict d;
+                d["extruder"] = kv.first;          // 1-based, 0 == unpainted
+                d["facets"]   = kv.second;
+                d["fraction"] = total ? double(kv.second) / double(total) : 0.0;
+                rows.append(d);
+            }
+            out["painted"]      = true;
+            out["extruders"]    = rows;
+            out["total_facets"] = total;
+            return out;
+        })
+        // ---- region -> extruder mapping --------------------------------------
+        // Move painted regions onto different filament slots. LOSSLESS: rewrites
+        // state on the selector's own leaves, so an author's sub-facet paint
+        // survives. Going through set_facet() would undivide and quietly coarsen
+        // it -- which is why TriangleSelector::remap_states is added here rather
+        // than composing the public API (PrusaSlicer ships remap_states upstream;
+        // this tree, like BambuStudio, does not).
+        .def("remap_paint_extruders", [](const PyVolume &v, const std::map<int, int> &mapping) {
+            main_thread("Volume.remap_paint_extruders");
+            ModelVolume *vol = volume_at(v, "Volume.remap_paint_extruders");
+            if (vol->mmu_segmentation_facets.get_data().triangles_to_split.empty())
+                throw std::runtime_error("remap_paint_extruders: volume has no MMU paint");
+            const int emax = int(EnforcerBlockerType::ExtruderMax);
+            for (const auto &kv : mapping) {
+                if (kv.first < 0 || kv.first > emax || kv.second < 0 || kv.second > emax)
+                    throw std::runtime_error(
+                        "remap_paint_extruders: extruder ids are 1.." + std::to_string(emax) +
+                        " (0 = unpainted); got " + std::to_string(kv.first) + "->" +
+                        std::to_string(kv.second));
+            }
+            TriangleSelector sel(vol->mesh());
+            sel.deserialize(vol->mmu_segmentation_facets.get_data(), false);
+            const int changed = sel.remap_states(mapping);
+            vol->mmu_segmentation_facets.set(sel);
+            return changed;
+        }, py::arg("mapping"))
         .def("clear_mmu_paint", [](const PyVolume &v) {
             main_thread("Volume.clear_mmu_paint");
             volume_at(v, "Volume.clear_mmu_paint")->mmu_segmentation_facets.reset();
@@ -2803,6 +2942,103 @@ void register_object_model(py::module_ &m)
                     out.push_back(p.name);
             return out;
         })
+        // Enumerate installable vendor machines (loads the full system vendor set
+        // from resources/profiles on demand — Orca loads them lazily).
+        .def("available_printers", [](const PyApp &) {
+            main_thread("app.available_printers");
+            auto &app = GUI::wxGetApp();
+            auto *pb = app.preset_bundle;
+            std::vector<std::pair<std::string, std::string>> _vendor_load_report;
+            if (pb->vendors.size() < 5)   // only Custom/OrcaFilamentLibrary -> load all
+                _vendor_load_report = load_all_vendor_profiles(pb);
+            // Stash the report where a second call can read it — keeping
+            // available_printers' return shape identical across the three forks.
+            {
+                py::list rep;
+                for (const auto &kv : _vendor_load_report) {
+                    py::dict d;
+                    d["vendor"] = kv.first;
+                    d["result"] = kv.second;
+                    rep.append(d);
+                }
+                py::module_::import("pyslic3r").attr("_vendor_load_report") = rep;
+            }
+            py::list out;
+            for (const auto &vp : pb->vendors) {
+                for (const auto &pm : vp.second.models) {
+                    if (pm.technology != ptFFF) continue;
+                    py::dict d;
+                    d["vendor"] = vp.second.id;
+                    d["model"]  = pm.name;
+                    py::list vars;
+                    for (const auto &v : pm.variants) vars.append(v.name);
+                    d["variants"] = vars;
+                    out.append(d);
+                }
+            }
+            return out;
+        })
+        // Install a vendor machine the way the first-run wizard does — load the vendor
+        // profiles, mark it visible (set_variant), install default filament(s), reload,
+        // select. Unblocks apply_preset()/slicing on a fresh datadir with no wizard. [B O].
+        .def("install_printer", [](const PyApp &, const std::string &name) {
+            main_thread("app.install_printer");
+            auto &app = GUI::wxGetApp();
+            auto *pb = app.preset_bundle;
+            auto *ac = app.app_config;
+            if (pb == nullptr || ac == nullptr) throw std::runtime_error("no preset bundle / app config");
+            const Preset *mp = pb->printers.find_preset(name, false);
+            if (mp == nullptr) {   // fresh datadir: load the full system vendor set, retry
+                // Same loader available_printers() uses. It used to be a second copy
+                // that reset the bundle per vendor, so enumeration saw 384 models and
+                // this retry then found only the last vendor's presets.
+                load_all_vendor_profiles(pb);
+                mp = pb->printers.find_preset(name, false);
+            }
+            if (mp == nullptr) throw std::runtime_error("no such printer preset: " + name + " (see available_printers())");
+            if (mp->vendor == nullptr) throw std::runtime_error("not a vendor/system preset: " + name);
+            const std::string vendor  = mp->vendor->id;
+            const std::string model   = mp->config.opt_string("printer_model");
+            const std::string variant = mp->config.opt_string("printer_variant");
+            if (model.empty() || variant.empty())
+                throw std::runtime_error("preset missing printer_model/printer_variant: " + name);
+            ac->set_variant(vendor, model, variant, true);
+            std::vector<std::string> fils;
+            for (const auto &vp : pb->vendors)
+                for (const auto &pm : vp.second.models)
+                    if (pm.name == model || pm.id == model)
+                        for (const auto &f : pm.default_materials) fils.push_back(f);
+            if (!fils.empty()) {
+                std::map<std::string, std::string> sec =
+                    ac->has_section(AppConfig::SECTION_FILAMENTS)
+                        ? ac->get_section(AppConfig::SECTION_FILAMENTS)
+                        : std::map<std::string, std::string>{};
+                for (const auto &f : fils) sec[f] = "true";
+                ac->set_section(AppConfig::SECTION_FILAMENTS, sec);
+            }
+            // Do NOT call load_presets() here. It re-reads data_dir()/system
+            // (load_system_presets_from_json, PresetBundle.cpp:2194), which on a
+            // headless datadir is empty -- so it replaced the ~1000 presets just
+            // merged from resources/profiles with the single default, and
+            // apply_preset then could not find the printer install_printer had
+            // reported installing. Seeding datadir/system does not fix it; the
+            // merged catalogue is the source of truth on this fork.
+            //
+            // What the reload was wanted for is narrower than the reload:
+            //   * apply the AppConfig variant we just set  -> load_installed_printers
+            //   * settle compatibility for the new printer -> update_compatible
+            pb->load_installed_printers(*ac);
+            pb->printers.select_preset_by_name(name, true);
+            pb->update_compatible(PresetSelectCompatibleType::Always);
+            int vis = 0;
+            for (const Preset &pr : pb->printers.get_presets()) if (pr.is_visible) ++vis;
+            py::dict out;
+            out["printer"] = name; out["vendor"] = vendor;
+            out["model"] = model; out["variant"] = variant;
+            out["filaments_installed"] = (int) fils.size();
+            out["visible_printers"] = vis;
+            return out;
+        }, py::arg("name"))
         // Cloud device plane (M4). Registered in PyDevice.cpp; exposed here as
         // app.device. Account/app-level (one logged-in account), so it hangs
         // off Application, not Document.
