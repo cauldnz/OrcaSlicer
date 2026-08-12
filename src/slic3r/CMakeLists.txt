@@ -843,14 +843,25 @@ if (UNIX AND NOT APPLE)
     pkg_check_modules(GST_BASE REQUIRED gstreamer-base-1.0)
     target_link_libraries(libslic3r_gui ${GSTREAMER_LIBRARIES} ${GST_BASE_LIBRARIES})
 
+    target_include_directories(libslic3r_gui SYSTEM PRIVATE ${GSTREAMER_INCLUDE_DIRS} ${GST_BASE_INCLUDE_DIRS})
+endif ()
+
+# pyslic3r runtime wiring. This MUST stay outside the `if (UNIX AND NOT APPLE)`
+# block above. It used to sit between the two GStreamer lines inside it —
+# un-indented, so it read as top-level — which meant that on macOS and Windows
+# libslic3r_gui was compiled WITHOUT BBS_PY_RUNTIME and never linked
+# libbambu_api. Nothing failed loudly: libbambu_api still built (it is added from
+# its own platform-independent `if (BBS_PY_RUNTIME)` above), the app linked, and
+# it ran — as vanilla OrcaSlicer, with `pyslic3r::host_init()` preprocessed away
+# and every PYSLIC3R_SCRIPT silently ignored. Found on the macOS bring-up,
+# 2026-08-12; the tri-platform invariant (CLAUDE.md #6) had only ever been
+# exercised on Linux for this target.
 if (BBS_PY_RUNTIME)
     # GUI_App.cpp hooks host_init/host_shutdown; libbambu_api calls back into
     # Plater. Static-library cycle, resolved at final link.
     target_compile_definitions(libslic3r_gui PRIVATE BBS_PY_RUNTIME=1)
     target_link_libraries(libslic3r_gui libbambu_api)
     target_link_libraries(libbambu_api libslic3r_gui)
-endif ()
-    target_include_directories(libslic3r_gui SYSTEM PRIVATE ${GSTREAMER_INCLUDE_DIRS} ${GST_BASE_INCLUDE_DIRS})
 endif ()
 
 # Add a definition so that we can tell we are compiling slic3r.
