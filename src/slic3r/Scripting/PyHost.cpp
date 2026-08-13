@@ -118,6 +118,12 @@ void host_init()
     s_parked_gil = std::make_unique<py::gil_scoped_release>();
     s_initialized = true;
 
+    // Before anything that can raise a dialog. The self-test used to arm this
+    // itself, which left the script and bridge paths — i.e. every test, every
+    // example and the whole matrix gate — with no modal protection at all, so a
+    // dialog wedged the run until timeout with an empty log.
+    maybe_start_modal_dismisser();
+
     maybe_start_m0_selftest();
     maybe_start_bridge();
     maybe_run_user_script();
