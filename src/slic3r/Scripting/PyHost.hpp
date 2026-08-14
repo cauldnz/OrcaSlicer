@@ -37,6 +37,13 @@ void run_on_main_blocking(std::function<void()> fn);
 // str(result). Safe from any thread.
 std::string py_eval_str(const std::string &expr);
 
+// Headless modal auto-dismisser. Armed by host_init ONLY for an unattended
+// session (env PYSLIC3R_SCRIPT or PYSLIC3R_BRIDGE_PORT) — never for an ordinary
+// GUI user, whose dialogs must survive. A modal with nobody to click it wedges
+// an automated run until its timeout; note a missing input file raises a DIALOG,
+// not an exception, so this is what stops that presenting as a silent hang.
+void maybe_start_modal_dismisser();
+
 // M0 self-test: no-op unless env PYSLIC3R_M0_TEST=1. Called by host_init.
 void maybe_start_m0_selftest();
 

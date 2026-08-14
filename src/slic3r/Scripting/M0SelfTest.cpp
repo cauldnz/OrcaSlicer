@@ -26,6 +26,7 @@
 #include <wx/app.h>
 #include <wx/dialog.h>
 #include <wx/timer.h>
+#include <wx/stattext.h>
 #include <wx/toplevel.h>
 #include <wx/version.h>
 
@@ -60,24 +61,77 @@ struct M0Results
 M0Results   s_results;
 std::thread s_worker;
 
+// Best-effort recovery of a dialog's message. wxWidgets exposes no generic
+// accessor, so walk the children for the first non-empty static text — which is
+// where wxMessageDialog and the Slic3r MsgDialog family put theirs.
+std::string dialog_text(wxWindow *w, int depth = 0)
+{
+    if (depth > 3)
+        return {};
+    for (wxWindow *child : w->GetChildren()) {
+        if (auto *label = dynamic_cast<wxStaticText *>(child)) {
+            std::string s = label->GetLabel().ToStdString();
+            if (!s.empty())
+                return s;
+        }
+        std::string nested = dialog_text(child, depth + 1);
+        if (!nested.empty())
+            return nested;
+    }
+    return {};
+}
+
 // Headless modal auto-dismisser. Run offscreen, cloud/device operations can
 // pop informational MessageDialogs (e.g. GUI_App::process_network_msg emits
 // "update_studio"/"wait_info" because a from-source build isn't a recognised
 // official Studio version) — a ShowModal with no human to click it wedges the
 // app. This repeating timer fires even inside a nested ShowModal loop and ends
-// any stray modal, so automated/headless runs never hang on one. (A real
-// deployment would instead capture such messages; here we just dismiss them.)
+// any stray modal, so unattended runs never hang on one.
+//
+// It is armed by maybe_start_modal_dismisser() from host_init, and ONLY for an
+// unattended session. It used to be armed by the M0 self-test alone, which left
+// every scripted run — the whole test suite — unprotected (#111).
 class ModalDismissTimer : public wxTimer
 {
 public:
     void Notify() override
     {
+        // Snapshot first: EndModal can mutate wxTopLevelWindows while we walk it.
+        std::vector<wxDialog *> modals;
         for (wxWindow *w : wxTopLevelWindows)
             if (auto *dlg = dynamic_cast<wxDialog *>(w))
-                if (dlg->IsModal()) {
-                    BOOST_LOG_TRIVIAL(warning) << "pyslic3r: auto-dismissing headless modal";
-                    dlg->EndModal(wxID_OK);
-                }
+                if (dlg->IsModal())
+                    modals.push_back(dlg);
+
+        for (wxDialog *dlg : modals) {
+            // Say WHAT was dismissed. A silently swallowed error dialog turns a
+            // real product error into a mystery pass, which is a worse failure
+            // than the hang this exists to prevent — the caller sees a green run
+            // and never learns the app was trying to report something.
+            // GetClassName() is const wxChar* (wchar_t*) — via wxString, not a
+            // direct std::string conversion.
+            const std::string cls   = wxString(dlg->GetClassInfo()->GetClassName()).ToStdString();
+            const std::string title = dlg->GetTitle().ToStdString();
+            const std::string text  = dialog_text(dlg);
+
+            BOOST_LOG_TRIVIAL(warning)
+                << "pyslic3r: auto-dismissing headless modal [" << cls << "]"
+                << " title=\"" << title << "\" text=\"" << text << "\"";
+
+            // ALSO to stdout, deliberately. BOOST_LOG is not enough: BambuStudio
+            // encrypts its log file, so a dismissal recorded only there is
+            // invisible to the harness reading the process output — which is the
+            // one reader that needs it. Same channel the script runner uses for
+            // its PYSLIC3R_SCRIPT: OK/ERROR line.
+            std::printf("PYSLIC3R_MODAL_DISMISSED: [%s] title=\"%s\" text=\"%s\"\n",
+                        cls.c_str(), title.c_str(), text.c_str());
+            std::fflush(stdout);
+
+            dlg->EndModal(wxID_OK);
+        }
+        // Nested modals (a dialog raised from inside another's event loop) are
+        // handled by the next tick — this is a repeating timer, and the outer
+        // one cannot close until the inner has.
     }
 };
 // Heap-allocated at Start() time (NOT a static global — a wxTimer constructed
@@ -410,6 +464,22 @@ void run_selftest_on_main()
 }
 
 } // anonymous namespace
+
+void maybe_start_modal_dismisser()
+{
+    // Only for an UNATTENDED session. The runtime is on by default, so host_init
+    // runs for ordinary GUI users too — arming this for them would silently eat
+    // dialogs a human was meant to read, which is far worse than the hang.
+    //
+    // Same predicate the first-run wizard already uses to detect a scripted
+    // session (GUI_App::config_wizard_startup): a script runner or the bridge.
+    if (std::getenv("PYSLIC3R_SCRIPT") == nullptr &&
+        std::getenv("PYSLIC3R_BRIDGE_PORT") == nullptr)
+        return;
+
+    BOOST_LOG_TRIVIAL(info) << "pyslic3r: unattended session — arming the modal dismisser";
+    start_modal_dismisser();
+}
 
 void maybe_start_m0_selftest()
 {

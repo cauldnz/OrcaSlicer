@@ -29,6 +29,24 @@ target_include_directories(libbambu_api PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../U
 
 target_compile_definitions(libbambu_api PRIVATE BBS_PY_RUNTIME=1)
 
+# wx includes reach this target through the directory-scope
+# include(${wxWidgets_USE_FILE}) in src/CMakeLists.txt — but ONLY on the
+# module-mode branch of find_package, which is Linux-only. macOS and Windows
+# take the CONFIG branch, which sets no wxWidgets_USE_FILE and exports imported
+# targets instead, so that include() is skipped and this target saw no wx
+# include path at all: every TU here failed on <wx/app.h>. (Found building on
+# macOS 2026-08-12; libslic3r_gui was unaffected because it links wx::* directly
+# and picks the paths up as usage requirements.)
+#
+# Take the includes and defines off the imported target. Deliberately NOT the
+# libraries, for the link-order reason documented below.
+if (NOT wxWidgets_USE_FILE AND TARGET wx::wxcore)
+    target_include_directories(libbambu_api PRIVATE
+        $<TARGET_PROPERTY:wx::wxcore,INTERFACE_INCLUDE_DIRECTORIES>)
+    target_compile_definitions(libbambu_api PRIVATE
+        $<TARGET_PROPERTY:wx::wxcore,INTERFACE_COMPILE_DEFINITIONS>)
+endif ()
+
 # Plain (non-keyword) signature to stay compatible with the parent scope's
 # usage on libslic3r_gui; wxWidgets flags/includes arrive via the directory-
 # scope include(${wxWidgets_USE_FILE}) in src/CMakeLists.txt. Deliberately
