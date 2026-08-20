@@ -884,7 +884,7 @@ void register_object_model(py::module_ &m)
                     tmp.set_deserialize_strict(key, value);
                     int m = tmp.option<ConfigOptionEnum<FilamentMapMode>>("filament_map_mode")->getInt();
                     if (m < 0 || m > int(fmmDefault))
-                        throw std::runtime_error("filament_map_mode out of range 0..5");
+                        throw std::runtime_error("filament_map_mode out of range 0..3");
                     plater->set_global_filament_map_mode(FilamentMapMode(m));
                     plater->schedule_background_process();
                     return;
@@ -2232,7 +2232,7 @@ void register_object_model(py::module_ &m)
                     pb->project_config.option<ConfigOptionEnum<FilamentMapMode>>("filament_map_mode")->value;
                 FilamentMapMode cur = plate->get_filament_map_mode();
                 FilamentMapMode eff = (cur == fmmDefault) ? global_mode : cur;
-                if (eff != fmmManual && eff != fmmNozzleManual)
+                if (eff != fmmManual)  // Orca has no NozzleManual mode
                     plate->set_filament_map_mode(fmmManual);
                 plate->set_filament_maps(maps);
                 plater->schedule_background_process();
@@ -2242,7 +2242,7 @@ void register_object_model(py::module_ &m)
         // REGROUPS filaments at slice time and discards the map, so setting the
         // map without pinning the mode here achieves nothing.
         // FilamentMapMode: 0 AutoForFlush, 1 AutoForMatch, 2 Manual,
-        //                  3 NozzleManual, 4 AutoForQuality, 5 Default.
+        //                  3 Default (Orca: no NozzleManual/AutoForQuality).
         .def_property("filament_map_mode",
             [](const PyPlate &p) {
                 main_thread("Plate.filament_map_mode");
@@ -2261,8 +2261,8 @@ void register_object_model(py::module_ &m)
                 // of bounds, which is not caught in a release build.
                 if (mode < 0 || mode > int(fmmDefault))
                     throw std::runtime_error(
-                        "filament_map_mode must be 0..5 (0 AutoForFlush, 1 AutoForMatch, "
-                        "2 Manual, 3 NozzleManual, 4 AutoForQuality, 5 Default); got " +
+                        "filament_map_mode must be 0..3 (0 AutoForFlush, 1 AutoForMatch, "
+                        "2 Manual, 3 Default); got " +
                         std::to_string(mode));
                 plate->set_filament_map_mode(FilamentMapMode(mode));
                 plater->schedule_background_process();
