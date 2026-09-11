@@ -9190,6 +9190,18 @@ bool GUI_App::config_wizard_startup()
 
 void GUI_App::check_updates(const bool verbose)
 {
+#ifdef BBS_PY_RUNTIME
+    // pyslic3r: config_update() opens a modal when new vendor profiles are
+    // published (SHOW_TEXT_BOX). Headless nobody dismisses it, and since this
+    // runs off a pending event the block lands in the NEXT wxYield -- i.e. it
+    // reads as an arrange()/slice() hang, not as an update prompt. That is
+    // exactly what wedged BambuStudio for weeks; Orca only reaches the modal via
+    // the menu path (verbose), so guard it before it ever bites here.
+    if (pyslic3r::headless_session()) {
+        BOOST_LOG_TRIVIAL(info) << "pyslic3r: skipping preset-update check (headless)";
+        return;
+    }
+#endif
 	PresetUpdater::UpdateResult updater_result;
 	try {
 		updater_result = preset_updater->config_update(app_config->orig_version(), verbose ? PresetUpdater::UpdateParams::SHOW_TEXT_BOX : PresetUpdater::UpdateParams::SHOW_NOTIFICATION);

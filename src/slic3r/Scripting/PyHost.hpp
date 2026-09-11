@@ -15,6 +15,7 @@
 
 #include <functional>
 #include <string>
+#include <vector>
 
 namespace pyslic3r {
 
@@ -60,6 +61,17 @@ void maybe_start_m0_selftest();
 void maybe_start_bridge();
 
 void maybe_run_user_script();
+
+// Headless guards. A scripted (PYSLIC3R_SCRIPT) or bridged (PYSLIC3R_BRIDGE_PORT)
+// session has no human to click a dialog, so a ShowModal() in the load path is a
+// permanent hang rather than a prompt. Core sites that would open one ask
+// headless_session() first and record what they suppressed here; scripts read it
+// back through Document.warnings instead of clicking OK. Thread-safe; the bridge
+// may read while the main thread writes.
+bool                     headless_session();
+void                     push_warning(const std::string &msg);
+std::vector<std::string> warnings();
+void                     clear_warnings();
 
 } // namespace pyslic3r
 
