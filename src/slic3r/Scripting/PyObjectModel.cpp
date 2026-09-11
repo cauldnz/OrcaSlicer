@@ -40,6 +40,7 @@
 #include "libslic3r/Shape/TextShape.hpp"   // load_text_shape / TextResult (editable text)
 #include "libslic3r/BoundingBox.hpp"
 #include "libslic3r/Config.hpp"
+#include "libslic3r/LocalesUtils.hpp"   // float_to_string_decimal_point (arrange spacing)
 #include "libslic3r/Preset.hpp"
 #include "libslic3r/PresetBundle.hpp"
 #include "libslic3r/Print.hpp"                 // Print, PrintStatistics
@@ -48,6 +49,7 @@
 #include "libslic3r/Format/bbs_3mf.hpp"        // LoadStrategy
 #include "libslic3r/CustomGCode.hpp"      // colour-change-by-height
 #include "slic3r/GUI/GUI_App.hpp"
+#include "PyHost.hpp"                       // warnings()/clear_warnings() (#121)
 #include <pybind11/eval.h>                  // py::exec (download helper)
 #include "slic3r/GUI/Plater.hpp"
 #include "libslic3r/CutUtils.hpp"   // Cut class + ModelObjectCutAttribute (reworked cut)
@@ -182,6 +184,31 @@ Preset::Type preset_type(ConfigSource s)
     case ConfigSource::Printer:  return Preset::TYPE_PRINTER;
     default:                     return Preset::TYPE_INVALID;
     }
+}
+
+// The Arrange-options "Spacing" slider (#122). Writes the live setting AND the
+// persisted one, which is what the GUI slider does -- write only the live copy
+// and the next app-config reload silently reverts the caller's layout rule.
+// The key is per-sequence (`postfix`), because by-object arrangement keeps its
+// own spacing.
+void set_arrange_spacing(GUI::Plater *plater, double mm)
+{
+    if (mm < 0.0)
+        throw std::runtime_error("arrange spacing must be >= 0 (0 = auto)");
+    auto *canvas = plater->canvas3D();
+    auto &settings = canvas->get_arrange_settings();
+    settings.distance = float(mm);
+    // Orca's ArrangeSettings has no `postfix` member (Bambu's does) -- the imgui
+    // dialog derives the app-config key from printer technology and which of the
+    // two FFF slots is active. Same derivation, through the public accessors:
+    // by-object layouts keep their own spacing because sequential printing needs
+    // the gantry clearance.
+    const bool seq = &settings == &canvas->get_arrange_settings(PrintSequence::ByObject);
+    const std::string postfix = plater->printer_technology() == ptSLA ? "_sla"
+                                : seq ? "_fff_seq_print" : "_fff";
+    if (auto *appcfg = GUI::wxGetApp().app_config)
+        appcfg->set("arrange", ("min_object_distance" + postfix).c_str(),
+                    float_to_string_decimal_point(settings.distance));
 }
 
 GUI::PartPlate *plate_or_throw(int plate_idx, const char *what)
@@ -1299,6 +1326,71 @@ void register_object_model(py::module_ &m)
             obj->invalidate_bounding_box();
             plater->changed_object(int(o.idx));           // same refresh the GUI uses
         }, py::arg("dx"), py::arg("dy"), py::arg("dz"))
+        // ---- plate membership (#122) --------------------------------------
+        // Which plate this object is on, or -1 when it sits outside every plate
+        // (what the GUI paints grey and refuses to slice). Positional, and read
+        // from instance 0 -- an object whose instances straddle plates reports
+        // where its first one landed.
+        .def_property_readonly("plate_index", [](const PyObject &o) {
+            auto &list = plater_or_throw("Object.plate_index")->get_partplate_list();
+            object_at(o.idx, "Object.plate_index");   // existence check
+            for (int i = 0; i < list.get_plate_count(); ++i) {
+                GUI::PartPlate *plate = list.get_plate(i);
+                if (plate != nullptr && plate->contain_instance(int(o.idx), 0))
+                    return i;
+            }
+            return -1;
+        })
+        // Move the object onto another plate, exactly as dragging it there does:
+        // the object keeps its position RELATIVE to the plate, so a layout built
+        // on plate 1 survives the move. An object that was on no plate is centred
+        // on the target instead. Returns the plate index it ended up on -- which
+        // is measured, not assumed, because placement is positional.
+        .def("move_to_plate", [](const PyObject &o, int index) {
+            auto *plater = plater_or_throw("Object.move_to_plate");
+            auto &list   = plater->get_partplate_list();
+            if (index < 0 || index >= list.get_plate_count())
+                throw py::index_error("plate index out of range");
+            ModelObject    *obj    = object_at(o.idx, "Object.move_to_plate");
+            GUI::PartPlate *target = list.get_plate(index);
+            if (target == nullptr) throw std::runtime_error("plate gone");
+
+            int from = -1;
+            for (int i = 0; i < list.get_plate_count(); ++i) {
+                GUI::PartPlate *pl = list.get_plate(i);
+                if (pl != nullptr && pl->contain_instance(int(o.idx), 0)) { from = i; break; }
+            }
+            if (from == index)
+                return index;
+
+            Vec3d delta = Vec3d::Zero();
+            if (from >= 0) {
+                delta = target->get_origin() - list.get_plate(from)->get_origin();
+                delta.z() = 0.0;
+            } else {
+                const BoundingBoxf3 bb = obj->bounding_box_approx();
+                const Vec3d         c  = target->get_build_volume().center();
+                delta = Vec3d(c.x() - bb.center().x(), c.y() - bb.center().y(), 0.0);
+            }
+
+            GUI::Plater::TakeSnapshot snap(plater, std::string("API: move object to plate"));
+            obj->translate_instances(delta);
+            obj->invalidate_bounding_box();
+            // The plate list does not watch the model: the GUI tells it an instance
+            // moved (Selection::notify_instance_update does this after a drag), and
+            // that is what re-assigns the instance to a plate. Skip it and the object
+            // moves on screen while every plate still believes the old layout.
+            for (size_t i = 0; i < obj->instances.size(); ++i)
+                list.notify_instance_update(int(o.idx), int(i));
+            plater->changed_object(int(o.idx));
+
+            for (int i = 0; i < list.get_plate_count(); ++i) {
+                GUI::PartPlate *pl = list.get_plate(i);
+                if (pl != nullptr && pl->contain_instance(int(o.idx), 0))
+                    return i;
+            }
+            return -1;
+        }, py::arg("index"))
         .def("duplicate", [](const PyObject &o) {
             main_thread("Object.duplicate");
             auto *plater = plater_or_throw("Object.duplicate");
@@ -2131,6 +2223,22 @@ void register_object_model(py::module_ &m)
     // ---- Plate / PlateList ------------------------------------------------
     py::class_<PyPlate>(m, "Plate")
         .def_property_readonly("index", [](const PyPlate &p) { return p.idx; })
+        .def("objects", [](const PyPlate &p) {
+            // Which objects sit on this plate. Membership is positional in these
+            // apps -- a plate owns whatever overlaps it, which is why the GUI lets
+            // you drag an object from one plate to the next -- so the plate list is
+            // the only place it is written down. Same query object_count counts, so
+            // the two cannot disagree.
+            GUI::PartPlate *plate = plate_or_throw(p.idx, "Plate.objects");
+            Model          &model = model_or_throw("Plate.objects");
+            py::list        out;
+            for (ModelObject *mo : plate->get_objects_on_this_plate()) {
+                auto it = std::find(model.objects.begin(), model.objects.end(), mo);
+                if (it != model.objects.end())
+                    out.append(PyObject{ size_t(it - model.objects.begin()) });
+            }
+            return out;
+        })
         .def_property_readonly("object_count", [](const PyPlate &p) {
             auto &list = plater_or_throw("Plate.object_count")->get_partplate_list();
             GUI::PartPlate *plate = list.get_plate(p.idx);
@@ -2331,6 +2439,28 @@ void register_object_model(py::module_ &m)
             return PyPlate{i};
         })
         // ---- M2 mutation --------------------------------------------------
+        // Arrange spacing in mm -- the "Spacing" slider in the Arrange options
+        // popup, and 0 means auto (the app picks per printer/sequence). Read and
+        // written on the settings the CURRENT print sequence uses: by-object
+        // layouts have their own spacing, because sequential printing needs the
+        // gantry clearance and by-layer does not.
+        //
+        // Exposed because "arrange for a printer other than the selected one" has
+        // no other route: MakerWorld pins a print-by-object profile to a printer
+        // family and then drops the members whose clearance the layout fails, so a
+        // shippable layout has to be arranged to the family's WORST case, not to
+        // the machine doing the slicing (#122).
+        .def_property("spacing",
+            [](const PyPlateList &) {
+                auto *plater = plater_or_throw("PlateList.spacing");
+                main_thread("PlateList.spacing");
+                return double(plater->canvas3D()->get_arrange_settings().distance);
+            },
+            [](const PyPlateList &, double mm) {
+                auto *plater = plater_or_throw("PlateList.spacing");
+                main_thread("PlateList.spacing");
+                set_arrange_spacing(plater, mm);
+            })
         .def("orient", [](const PyPlateList &, bool wait) {
             // Auto-orient objects (toolbar Orient). Async OrientJob; same
             // event-pump wait as arrange. Bambu/Orca only (Prusa has no orient).
@@ -2369,13 +2499,20 @@ void register_object_model(py::module_ &m)
             list.select_plate(idx);
             return idx;
         }, py::arg("index"))
-        .def("arrange", [](const PyPlateList &, bool wait) {
+        .def("arrange", [](const PyPlateList &, bool wait, py::object spacing) {
             // Auto-arrange, same as the toolbar button. Asynchronous — starts a
             // background ArrangeJob (which snapshots itself). With wait=True,
             // pump the event loop (GIL released) until no job is running, so a
             // script can rely on the finished layout (same technique as
             // SliceJob.wait; not a nested modal loop).
+            //
+            // `spacing` (mm) is the Arrange-options slider, applied before the job
+            // starts; it persists afterwards exactly as moving the slider does.
             auto *plater = plater_or_throw("PlateList.arrange");
+            if (!spacing.is_none()) {
+                main_thread("PlateList.arrange(spacing=)");
+                set_arrange_spacing(plater, spacing.cast<double>());
+            }
             plater->arrange();
             if (!wait) return;
             main_thread("PlateList.arrange(wait=True)");
@@ -2394,7 +2531,7 @@ void register_object_model(py::module_ &m)
                 if (wxTheApp != nullptr) wxTheApp->Yield(true);
                 wxMilliSleep(20);
             }
-        }, py::arg("wait") = false);
+        }, py::arg("wait") = false, py::arg("spacing") = py::none());
 
     // ---- SliceResult ------------------------------------------------------
     py::class_<PySliceResult>(m, "SliceResult")
@@ -2850,6 +2987,9 @@ void register_object_model(py::module_ &m)
         // call model.clear() first for a clean replace.
         .def("open_project", [](const PyDocument &, const std::string &path) {
             auto *plater = plater_or_throw("Document.open_project");
+            // Warnings are per-load: what the previous open suppressed is not
+            // this open's problem.
+            clear_warnings();
             GUI::Plater::TakeSnapshot snap(plater, std::string("API: open project"));
             std::vector<boost::filesystem::path> paths{ boost::filesystem::path(path) };
             plater->load_files(paths,
@@ -2858,6 +2998,12 @@ void register_object_model(py::module_ &m)
                 /*ask_multi=*/false);
             return plater->model().objects.size();
         }, py::arg("path"))
+        // What the loader would have told a human in a dialog. Headless those
+        // dialogs are suppressed (#121) -- a batch job reads them here instead and
+        // decides for itself whether to proceed. Cleared by each open_project.
+        .def_property_readonly("warnings", [](const PyDocument &) {
+            return warnings();
+        })
         .def("to_script", [](const PyDocument &) {
             main_thread("Document.to_script");
             return build_state_script();

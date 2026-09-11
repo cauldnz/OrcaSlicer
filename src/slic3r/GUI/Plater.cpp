@@ -1,4 +1,9 @@
 #include "Plater.hpp"
+
+#ifdef BBS_PY_RUNTIME
+#include "slic3r/Scripting/PyHost.hpp"   // headless_session/push_warning (#121)
+#endif
+
 #include "libslic3r/Config.hpp"
 #include "libslic3r_version.h"
 
@@ -5937,6 +5942,24 @@ void read_binary_stl(const std::string& filename, std::string& model_id, std::st
 }
 
 // BBS: backup & restore
+// pyslic3r (#121): every dialog in load_files is a permanent hang in a scripted
+// session -- nothing clicks OK -- and each one is informational: the load has
+// already succeeded. So each site asks this first, and what it suppressed is
+// recorded for Document.warnings to read back.
+static bool headless_note(const std::string &msg)
+{
+#ifdef BBS_PY_RUNTIME
+    if (!pyslic3r::headless_session())
+        return false;
+    BOOST_LOG_TRIVIAL(warning) << "pyslic3r: suppressed load dialog: " << msg;
+    pyslic3r::push_warning(msg);
+    return true;
+#else
+    (void) msg;
+    return false;
+#endif
+}
+
 std::vector<size_t> Plater::priv::load_files(const std::vector<fs::path>& input_files, LoadStrategy strategy, bool ask_multi)
 {
     std::vector<size_t> empty_result;
@@ -6129,6 +6152,11 @@ std::vector<size_t> Plater::priv::load_files(const std::vector<fs::path>& input_
                         BOOST_LOG_TRIVIAL(info) << __FUNCTION__ << ":" << __LINE__
                                                 << " "
                                                 << boost::format("3MF import message [%1%]: %2% | file: %3%") % into_u8(title) % into_u8(text) % path.string();
+                        // Every 3MF import notice comes through here -- including the
+                        // "newer version" one that every project saved by a current
+                        // slicer triggers -- so one guard covers the lot.
+                        if (headless_note(into_u8(title) + ": " + into_u8(text)))
+                            return;
                         show_info(q, text, title);
                     };
                     if (en_3mf_file_type == En3mfType::From_Prusa) {
@@ -6154,11 +6182,19 @@ std::vector<size_t> Plater::priv::load_files(const std::vector<fs::path>& input_
                                           "This could result in weak support or print quality issues."));
                                     msg_text += "\n\n" +
                                                 _(L("Would you like OrcaSlicer to automatically fix this by clearing the rotation template settings?"));
+                                    // Headless this is a question with no answerer. Leaving the
+                                    // project's own setting alone is the conservative half (it is what
+                                    // clicking No does), and the caller is told so it can clear the
+                                    // template itself if it wants the fix.
+                                    if (!headless_note("this project was made with OrcaSlicer 2.3.1-alpha and its "
+                                                       "sparse_infill_rotate_template may not suit the current infill "
+                                                       "pattern; left unchanged")) {
                                     MessageDialog dialog(wxGetApp().plater(), msg_text, "", wxICON_WARNING | wxYES | wxNO);
                                     dialog.SetButtonLabel(wxID_YES, _L("Yes"));
                                     dialog.SetButtonLabel(wxID_NO, _L("No"));
                                     if (dialog.ShowModal() == wxID_YES) {
                                         config_loaded.opt_string("sparse_infill_rotate_template") = "";
+                                    }
                                     }
                                 }
                             }
@@ -6456,11 +6492,13 @@ std::vector<size_t> Plater::priv::load_files(const std::vector<fs::path>& input_
                                     warning_message += "-" + *it + "\n";
                                 warning_message += "\n";
                                 //show_info(q, _L("The 3MF has the following modified G-code in filament or printer presets:") + warning_message + _L("Please confirm that all modified G-code is safe to prevent any damage to the machine!"), _L("Modified G-code"));
-                                MessageDialog dlg(q, _L("The 3MF has the following modified G-code in filament or printer presets:") + warning_message + _L("Please confirm that all modified G-code is safe to prevent any damage to the machine!"), _L("Modified G-code"));
-                                dlg.show_dsa_button();
-                                auto  res = dlg.ShowModal();
-                                if (dlg.get_checkbox_state())
-                                    wxGetApp().app_config->set("no_warn_when_modified_gcodes", "true");
+                                if (!headless_note("the 3MF's filament/printer presets contain modified G-code:" + warning_message)) {
+                                    MessageDialog dlg(q, _L("The 3MF has the following modified G-code in filament or printer presets:") + warning_message + _L("Please confirm that all modified G-code is safe to prevent any damage to the machine!"), _L("Modified G-code"));
+                                    dlg.show_dsa_button();
+                                    auto  res = dlg.ShowModal();
+                                    if (dlg.get_checkbox_state())
+                                        wxGetApp().app_config->set("no_warn_when_modified_gcodes", "true");
+                                }
                             }
                             else if ((validated == VALIDATE_PRESETS_PRINTER_NOT_FOUND) || (validated == VALIDATE_PRESETS_FILAMENTS_NOT_FOUND)) {
                                 std::string warning_message;
@@ -6469,11 +6507,13 @@ std::vector<size_t> Plater::priv::load_files(const std::vector<fs::path>& input_
                                     warning_message += "-" + *it + "\n";
                                 warning_message += "\n";
                                 //show_info(q, _L("The 3MF has the following customized filament or printer presets:") + warning_message + _L("Please confirm that the G-code within these presets is safe to prevent any damage to the machine!"), _L("Customized Preset"));
-                                MessageDialog dlg(q, _L("The 3MF has the following customized filament or printer presets:") + from_u8(warning_message)+ _L("Please confirm that the G-code within these presets is safe to prevent any damage to the machine!"), _L("Customized Preset"));
-                                dlg.show_dsa_button();
-                                auto  res = dlg.ShowModal();
-                                if (dlg.get_checkbox_state())
-                                    wxGetApp().app_config->set("no_warn_when_modified_gcodes", "true");
+                                if (!headless_note("the 3MF carries customized filament/printer presets:" + warning_message)) {
+                                    MessageDialog dlg(q, _L("The 3MF has the following customized filament or printer presets:") + from_u8(warning_message)+ _L("Please confirm that the G-code within these presets is safe to prevent any damage to the machine!"), _L("Customized Preset"));
+                                    dlg.show_dsa_button();
+                                    auto  res = dlg.ShowModal();
+                                    if (dlg.get_checkbox_state())
+                                        wxGetApp().app_config->set("no_warn_when_modified_gcodes", "true");
+                                }
                             }
                         }
 

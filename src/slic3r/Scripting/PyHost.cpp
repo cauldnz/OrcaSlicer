@@ -9,6 +9,7 @@
 #include <memory>
 #include <stdexcept>
 #include <string>
+#include <vector>
 
 #include <pybind11/embed.h>
 #include <thread>
@@ -60,6 +61,9 @@ double s_init_ms     = 0.0;
 // main thread) can acquire it around each call.
 std::unique_ptr<py::gil_scoped_release> s_parked_gil;
 
+std::mutex               s_warnings_mutex;
+std::vector<std::string> s_warnings;
+
 void ensure_main_thread(const char *what)
 {
     if (!wxThread::IsMain())
@@ -93,6 +97,32 @@ PYBIND11_EMBEDDED_MODULE(pyslic3r, m)
 // ---------------------------------------------------------------------------
 // Lifecycle
 // ---------------------------------------------------------------------------
+
+bool headless_session()
+{
+    return std::getenv("PYSLIC3R_SCRIPT") != nullptr ||
+           std::getenv("PYSLIC3R_BRIDGE_PORT") != nullptr;
+}
+
+void push_warning(const std::string &msg)
+{
+    std::lock_guard<std::mutex> lock(s_warnings_mutex);
+    // Bounded: a loader looping over many files must not grow this without end.
+    if (s_warnings.size() < 200)
+        s_warnings.push_back(msg);
+}
+
+std::vector<std::string> warnings()
+{
+    std::lock_guard<std::mutex> lock(s_warnings_mutex);
+    return s_warnings;
+}
+
+void clear_warnings()
+{
+    std::lock_guard<std::mutex> lock(s_warnings_mutex);
+    s_warnings.clear();
+}
 
 bool host_initialized() { return s_initialized; }
 double interpreter_init_ms() { return s_init_ms; }
