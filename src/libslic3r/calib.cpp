@@ -878,7 +878,9 @@ size_t CalibPressureAdvancePattern::max_numbering_length() const
     const int              num_patterns    = get_num_patterns();
 
     // note: only every other number is printed
-    for (std::string::size_type i = 0; i < num_patterns; i += 2) {
+    // int, not size_type: num_patterns is signed, and comparing it against an
+    // unsigned counter turned a negative count into a ~1.8e19 iteration bound.
+    for (int i = 0; i < num_patterns; i += 2) {
         std::string sNumber = convert_number_to_string(m_params.start + (i * m_params.step));
 
         if (sNumber.length() > most_characters) {
